@@ -91,7 +91,8 @@ Item {
     root.showLog = false
     root.result = null
     passwordField.text = ""
-    runProc.command = [root.runner, String(root.status.count || 0), String(root.status.tier || "")]
+    // The runner re-plans and installs only if this exact set is still pending.
+    runProc.command = [root.runner, root.fingerprint(root.status)]
     runProc.running = true
     Qt.callLater(function() { passwordField.forceActiveFocus() })
   }
@@ -102,6 +103,9 @@ Item {
     runProc.write(passwordField.text + "\n")
     passwordField.text = ""
   }
+
+  // Written by the helper with the set; the runner installs only if unchanged.
+  function fingerprint(st) { return String(st.fingerprint || "") }
 
   function cancelUpdate() {
     passwordField.text = ""

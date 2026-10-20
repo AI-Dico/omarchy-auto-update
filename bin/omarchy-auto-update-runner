@@ -21,7 +21,7 @@ The password is typed only into prompts shown while a privileged sudo process
 masked out of the log, kept in memory for this run only, and the process is
 made non-dumpable. Which step is running is read from the live process tree.
 """
-import ctypes, json, os, pty, re, resource, select, signal, subprocess, sys, time
+import ctypes, fcntl, json, os, pty, re, resource, select, signal, subprocess, sys, time
 
 TEST = os.environ.get("OMARCHY_AUTO_UPDATE_TEST") == "1"  # tests: fake sudo check
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -85,21 +85,45 @@ def check_password(password):
     return p.returncode == 0
 
 
-def privileged_sudo_owns(fd):
-    """True when the terminal's foreground process group is led by a sudo
-    process running with effective UID 0. An ordinary program cannot fake an
-    effective UID of 0, so this tells the real sudo prompt from imitations."""
-    if TEST:
-        return os.environ.get("OMARCHY_AUTO_UPDATE_TEST_TRUST") == "1"
+def proc_stat(pid):
+    """(name, pgrp, tty_nr) from /proc/<pid>/stat."""
+    with open(f"/proc/{pid}/stat") as f:
+        raw = f.read()
+    name = raw[raw.index("(") + 1:raw.rindex(")")]
+    fields = raw.rsplit(")", 1)[1].split()
+    return name, int(fields[2]), int(fields[4])
+
+
+def privileged_sudo_owns(fd, tty_nr):
+    """True when a sudo process running with effective UID 0 is in the
+    terminal's foreground process group. A sudo started from a script shares
+    the script's group, so every member is checked, not just the leader. An
+    ordinary program cannot fake an effective UID of 0, so this tells the real
+    sudo prompt from imitations."""
+    if TEST and os.environ.get("OMARCHY_AUTO_UPDATE_TEST_TRUST") == "1":
+        return True
     try:
         pgid = os.tcgetpgrp(fd)
-        with open(f"/proc/{pgid}/status") as f:
-            status = f.read()
-        name = re.search(r"^Name:\s*(\S+)", status, re.M).group(1)
-        euid = int(re.search(r"^Uid:\s*\d+\s+(\d+)", status, re.M).group(1))
-        return name == "sudo" and euid == 0
-    except (OSError, AttributeError, ValueError):
+    except OSError:
         return False
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            name, pgrp, tty = proc_stat(entry)
+            if pgrp != pgid or tty != tty_nr or name != "sudo":
+                continue
+            with open(f"/proc/{entry}/status") as f:
+                euid = int(re.search(r"^Uid:\s*\d+\s+(\d+)", f.read(), re.M).group(1))
+            if euid == 0:
+                return True
+        except (OSError, AttributeError, ValueError):
+            continue
+    return False
+
+
+def fingerprint(st):
+    return str(st.get("fingerprint") or "")
 
 
 def descendants(pid):
@@ -134,12 +158,13 @@ def current_phase(pid):
 
 def foreground():
     """Password exchange with the overlay. Returns the password or None."""
-    if len(sys.argv) >= 3:
-        # Re-plan right before installing: if the set grew or changed tier since
-        # the user agreed, show them the new one instead of installing it.
-        subprocess.run([HELPER, "run", "--force"], capture_output=True)
+    if len(sys.argv) >= 2:
+        # Re-plan right before installing: if any package or version changed
+        # since the user agreed, show them the new set instead of installing it.
+        agreed = sys.argv[1]
+        replan = subprocess.run([HELPER, "run", "--force"], capture_output=True)
         now = state()
-        if str(now.get("count", "")) != sys.argv[1] or str(now.get("tier", "")) != sys.argv[2]:
+        if replan.returncode != 0 or now.get("state") != "ready" or fingerprint(now) != agreed:
             say(type="changed")
             return None
     retry = False
@@ -169,10 +194,20 @@ def run_update(password):
     if pid == 0:
         os.execvpe("omarchy", ["omarchy", "update", "-y"], env)
 
+    # The terminal device of this run, to match sudo processes against.
+    tty_nr = 0
+    for _ in range(20):
+        try:
+            tty_nr = os.stat(os.readlink(f"/proc/{pid}/fd/0")).st_rdev
+            break
+        except OSError:
+            time.sleep(0.05)
     fd_log = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd_log, 0o600)
     log = os.fdopen(fd_log, "w", encoding="utf-8")
     secret = password
     buf, pending, last_phase, seen, status = b"", "", None, set(), None
+    no_snapshot = False
     try:
         while status is None:
             ready, _, _ = select.select([fd], [], [], 0.5)
@@ -185,7 +220,7 @@ def run_update(password):
                     _, status = os.waitpid(pid, 0)
                     break
                 buf = (buf + data)[-512:]
-                if PROMPT.search(buf) and privileged_sudo_owns(fd):
+                if PROMPT.search(buf) and privileged_sudo_owns(fd, tty_nr):
                     os.write(fd, (secret + "\n").encode())
                     buf = b""
                 pending += data.decode(errors="replace")
@@ -194,6 +229,8 @@ def run_update(password):
                     clean = ANSI.sub("", line).rstrip().replace(secret, "****")
                     if not clean:
                         continue
+                    if "without a snapshot" in clean:
+                        no_snapshot = True
                     log.write(clean + "\n")
                     emit(type="log", line=clean[:300])
                     m = PACMAN_STEP.search(clean)
@@ -214,7 +251,7 @@ def run_update(password):
         log.close()
 
     code = os.waitstatus_to_exitcode(status) if status is not None else 1
-    snapshot = "snapshot" in seen and bool(seen & AFTER_SNAPSHOT)
+    snapshot = "snapshot" in seen and bool(seen & AFTER_SNAPSHOT) and not no_snapshot
     if code == 0:
         kernel_gone = not os.path.isdir(f"/usr/lib/modules/{os.uname().release}")
         emit(type="done", ok=True, restart=kernel_gone or tier in ("restart", "major"),
@@ -233,13 +270,13 @@ def main():
     harden()
     os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME, 0o700)
-    if os.path.exists(PIDFILE):
-        try:
-            os.kill(int(open(PIDFILE).read()), 0)
-            say(type="detached", events=EVENTS, resumed=True)
-            return 0
-        except (OSError, ValueError):
-            pass
+    # One update at a time. The detached child keeps this lock for the run.
+    lock = os.open(os.path.join(RUNTIME, "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say(type="detached", events=EVENTS, resumed=True)
+        return 0
     password = foreground()
     if password is None:
         return 1
@@ -247,6 +284,7 @@ def main():
     with open(EVENTS, "w") as f:
         os.fchmod(f.fileno(), 0o600)
     if os.fork():
+        os.close(lock)
         say(type="detached", events=EVENTS)
         return 0
     os.setsid()

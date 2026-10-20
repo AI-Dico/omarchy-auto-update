@@ -41,7 +41,10 @@ write_state() {
 
 # Signatures are only "verified" when pacman requires them.
 signatures_required() {
-  ! grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=.*(Never|Optional)' /etc/pacman.conf
+  # Package signatures: plain Never/Optional or PackageNever/PackageOptional
+  # turn them off; DatabaseOptional only concerns the databases.
+  ! grep -E '^[[:space:]]*SigLevel[[:space:]]*=' /etc/pacman.conf |
+    grep -Eq '(=|[[:space:]])(Package)?(Never|Optional)([[:space:]]|$)'
 }
 
 # State with no package set: idle reasons and errors.
@@ -127,7 +130,7 @@ run() {
   local pending qu_err
   qu_err=$(mktemp)
   pending=$(pacman -Qu --dbpath "$DB" 2>"$qu_err" | grep -v '\[ignored\]' || true)
-  if [[ -s $qu_err ]]; then
+  if grep -q '^error:' "$qu_err"; then
     simple_state error "Couldn't read the package list: $(head -1 "$qu_err")"
     rm -f "$qu_err"
     cat "$STATE"
@@ -194,7 +197,7 @@ run() {
   [[ -n $waiting ]] && state=waiting
   [[ $downloaded == true ]] && signatures_required && verified=true
   printf '%s\n' "$pending" | python3 -c '
-import json, re, sys
+import hashlib, json, re, sys
 pending, plan, restart_re, state, waiting, downloaded, news, seen, now, valid, verified = sys.argv[1:12]
 restart = re.compile(restart_re)
 
@@ -232,6 +235,8 @@ out = {
     "omarchy": omarchy,
     "packages": sorted(packages, key=lambda p: (not restart.match(p["name"]), p["name"])),
     "count": len(packages),
+    # What the user agrees to: the runner installs only if this is unchanged.
+    "fingerprint": hashlib.sha256("\n".join(sorted(f"{p['name']} {p['to']}" for p in packages)).encode()).hexdigest(),
     "downloadBytes": size,
     "downloaded": downloaded == "true",
     "verified": verified == "true",
@@ -253,7 +258,14 @@ RUN_EVENTS="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-auto-update/run.jsonl
 status() {
   local s='{"state":"unknown","packages":[],"count":0}'
   [[ -f $STATE ]] && s=$(cat "$STATE")
-  # An update started from the overlay that the user hasn't dismissed yet.
+  # An update started from the overlay that the user hasn't dismissed yet. If
+  # its process is gone without saying it finished, record that it stopped.
+  if [[ -f $RUN_EVENTS ]] && ! grep -q '"type": "done"' "$RUN_EVENTS"; then
+    local lockf="${RUN_EVENTS%/*}/run.lock"
+    if [[ -f $lockf ]] && flock -n "$lockf" true 2>/dev/null; then
+      echo '{"type": "done", "ok": false, "error": "The update stopped unexpectedly. Run Omarchy update to finish it."}' >>"$RUN_EVENTS"
+    fi
+  fi
   if [[ -f $RUN_EVENTS ]]; then
     jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s"
   else

@@ -40,5 +40,11 @@ echo "3. wrong password"
 OMARCHY_AUTO_UPDATE_TEST_TRUST=1 drive wrong test
 grep -q '"retry": true' <<<"$FG" && ok "asks again after a wrong password" || no "asks again after a wrong password"
 
+echo "4. agreed set must match"
+T=$(mktemp -d); mkdir -p "$T/cache/omarchy-auto-update" "$T/run"
+FAKE_HELPER_DIR="$T/h"; mkdir -p "$FAKE_HELPER_DIR"
+FG=$(OMARCHY_AUTO_UPDATE_TEST=1 XDG_CACHE_HOME="$T/cache" XDG_RUNTIME_DIR="$T/run" "$RUNNER" deadbeef </dev/null)
+grep -q '"type": "changed"' <<<"$FG" && ok "stops when the set is not the agreed one" || no "stops when the set is not the agreed one"
+
 echo "passed $pass, failed $fail"
 ((fail == 0))
