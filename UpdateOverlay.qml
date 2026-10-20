@@ -243,10 +243,14 @@ Item {
       }
       if (e.finished && e.ok && !root.opened) {
         // Nothing left to say beyond a short note.
+        var a = root.status.applied || {}
         root.finishRun()
-        var n = root.status.applied ? root.status.applied.count : 0
-        Quickshell.execDetached(["notify-send", "-a", "Auto Update", "Omarchy is up to date",
-          (n === 1 ? "1 update was" : n + " updates were") + " installed while restarting."])
+        var n = a.count || 0
+        var body = "Installed while restarting."
+        if (a.bootMenu)
+          body += " A restore point was saved. If something seems wrong, pick it under Snapshots in the boot menu."
+        Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "15000",
+          (n === 1 ? "1 update installed" : n + " updates installed"), body])
         return
       }
       root.view = e.cancelled ? "details" : "done"

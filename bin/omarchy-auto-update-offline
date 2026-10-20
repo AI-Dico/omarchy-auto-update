@@ -52,7 +52,8 @@ MIN_FREE_BYTES = 10 * 1024 ** 3  # same floor as omarchy update
 OVERWRITE = "/usr/share/omarchy/*"  # as omarchy-update-system-pkgs
 KEYRINGS = ("archlinux-keyring", "omarchy-keyring")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9@._+-]+$")
-PKG_NAME = re.compile(r"^[A-Za-z0-9@._+-]+\.pkg\.tar(\.(zst|xz|gz|bz2|lz4|lrz|lzo|Z))?$")
+# A version with an epoch puts a colon in the file name (lib32-mesa-1:26.2.5-1-…).
+PKG_NAME = re.compile(r"^[A-Za-z0-9@._+:-]+\.pkg\.tar(\.(zst|xz|gz|bz2|lz4|lrz|lzo|Z))?$")
 PACMAN_ENV = dict(os.environ, LC_ALL="C", OMARCHY_UPDATE_PACMAN="1")
 # With --noconfirm pacman answers its own questions. A conflict already stops
 # the transaction; these would go ahead unseen, so they get "no" instead:
