@@ -10,7 +10,7 @@
 - 실행 중 세션의 라이브러리를 바꿔치기하는 시스템은 없다. A/B 슬롯(ChromeOS·Android·SteamOS), 스냅샷 기반 새 루트(transactional-update·rpm-ostree·macOS SSV), 오프라인 부팅 모드(systemd system-update.target·PackageKit) 중 하나를 쓴다.
 - 자동 롤백의 공통 요소 = **시도 횟수 카운터(보통 3) + 사용자 공간 헬스체크 + "성공" 표시 전까지 이전 버전 보존**.
 - Arch 는 부분 업그레이드를 지원하지 않는다. 그래서 "보안 패치만 먼저 자동 적용" 같은 패키지 단위 선별은 불가능하다. 선별 단위는 패키지가 아니라 **트랜잭션 전체(= 한 시점의 동기 DB 스냅샷)** 여야 한다.
-- 현재 Omarchy(`/Users/seunghan/contrib/omarchy/bin/`)에는 이미 10 GiB 여유 공간 검사, pacman 직접 업그레이드 가드, snapper 스냅샷, 커널 갱신 시 재부팅 확인, limine-snapper-restore 가 있다. 플러그인은 이것을 재사용하고 "배경 다운로드·DB 고정·부팅 확정·자동 롤백" 네 가지를 덧붙이는 형태가 맞다.
+- 현재 Omarchy(omacom/omarchy `bin/`)에는 이미 10 GiB 여유 공간 검사, pacman 직접 업그레이드 가드, snapper 스냅샷, 커널 갱신 시 재부팅 확인, limine-snapper-restore 가 있다. 플러그인은 이것을 재사용하고 "배경 다운로드·DB 고정·부팅 확정·자동 롤백" 네 가지를 덧붙이는 형태가 맞다.
 
 ---
 
@@ -120,7 +120,7 @@
 - 결론: Arch 생태계 도구들은 "자동 확인 + 수동 적용"이 표준이다. 무인 자동 적용은 Arch 위키가 권장하지 않는 영역(뉴스 개입 필요성 때문)이므로 플러그인의 자동 적용 범위는 보수적이어야 한다.
 
 ### 1.13 현 Omarchy 상태 (로컬 소스 확인)
-`/Users/seunghan/contrib/omarchy/bin/`
+omacom/omarchy `bin/`
 - `omarchy-update-requires-free-space`: 루트 여유 10 GiB 미만이면 중단.
 - `omarchy-update-pacman-guard`: omarchy update 를 우회한 직접 `pacman -Syu` 차단.
 - `omarchy-snapshot create|restore`: snapper 모든 config 에 number 스냅샷 + cleanup, restore=limine-snapper-restore. config 0개면 "복구 가능해 보이는 착시"를 막으려 실패 처리.
