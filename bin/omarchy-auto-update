@@ -6,11 +6,16 @@
 #   omarchy-auto-update ack-news        mark the current Arch news as read
 #   omarchy-auto-update ack-run         dismiss a finished update
 #   omarchy-auto-update update-now      open Omarchy's own updater (terminal fallback)
+#   omarchy-auto-update after-restart   after an update installed on restart: check the
+#                                       session and list what is left to finish
+#   omarchy-auto-update ack-applied     dismiss the result of an update installed on restart
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
 # both under ~/.cache/omarchy-auto-update. Arch does not support partial
 # upgrades, so the whole pending set is always fetched and judged together.
+# Installing on restart is bin/omarchy-auto-update-offline, run as root; this
+# only reads what it leaves in /var/lib/omarchy-auto-update.
 
 set -euo pipefail
 
@@ -23,6 +28,10 @@ LOCK="$BASE/run.lock"
 MIN_FREE_BYTES=$((10 * 1024 * 1024 * 1024)) # same floor as omarchy update
 VALID_SECONDS=$((3 * 24 * 3600))            # re-prepare after three days
 NEWS_URL="https://archlinux.org/feeds/news/"
+SPOOL="${OMARCHY_AUTO_UPDATE_SPOOL:-/var/lib/omarchy-auto-update}" # written by the offline installer
+TRIGGER="${OMARCHY_AUTO_UPDATE_TRIGGER:-/system-update}"
+APPLIED_SEEN="$BASE/applied-seen"
+HEALTH="$BASE/health.json"
 
 # A set that touches any of these is installed on restart, never under a
 # running session: kernel and boot chain, core libraries, graphics, the shell
@@ -112,8 +121,9 @@ run() {
     # Only a plain integer may reach the arithmetic below.
     valid=$(jq -r 'if (.validUntil | type) == "number" then (.validUntil | floor) else 0 end' "$STATE" 2>/dev/null || echo 0)
     [[ $valid =~ ^[0-9]{1,12}$ ]] || valid=0
-    # A prepared set stays good until it expires; nothing to redo.
-    if [[ $(jq -r .state "$STATE" 2>/dev/null) == ready ]] && (($(now) < valid)); then
+    # A prepared set stays good until it expires or a restart installed one.
+    if [[ $(jq -r .state "$STATE" 2>/dev/null) == ready ]] && (($(now) < valid)) &&
+      ! [[ $SPOOL/result.json -nt $STATE ]]; then
       cat "$STATE"
       return
     fi
@@ -209,10 +219,12 @@ for line in pending.splitlines():
 
 size = 0
 names = set(p["name"] for p in packages)
+transaction = []
 for line in plan.splitlines():
     parts = line.split()
     if len(parts) == 3 and parts[2].isdigit():
         size += int(parts[2])
+        transaction.append(f"{parts[0]} {parts[1]}")
         if parts[0] not in names:
             packages.append({"name": parts[0], "from": "", "to": parts[1]})
 
@@ -235,8 +247,10 @@ out = {
     "omarchy": omarchy,
     "packages": sorted(packages, key=lambda p: (not restart.match(p["name"]), p["name"])),
     "count": len(packages),
-    # What the user agrees to: the runner installs only if this is unchanged.
-    "fingerprint": hashlib.sha256("\n".join(sorted(f"{p['name']} {p['to']}" for p in packages)).encode()).hexdigest(),
+    # What the user agrees to: the whole transaction, as "name version" lines.
+    # The runner and bin/omarchy-auto-update-offline (as root) install only if
+    # their own plan gives the same value.
+    "fingerprint": hashlib.sha256("\n".join(sorted(transaction)).encode()).hexdigest(),
     "downloadBytes": size,
     "downloaded": downloaded == "true",
     "verified": verified == "true",
@@ -266,11 +280,76 @@ status() {
       echo '{"type": "done", "ok": false, "error": "The update stopped unexpectedly. Run Omarchy update to finish it."}' >>"$RUN_EVENTS"
     fi
   fi
-  if [[ -f $RUN_EVENTS ]]; then
-    jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s"
-  else
-    echo "$s"
+  [[ -f $RUN_EVENTS ]] && s=$(jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s")
+  offline_state "$s"
+}
+
+# What the offline installer left: a set waiting for a restart, and the result
+# of the last restart that installed one, until the user has seen it.
+offline_state() {
+  local s="$1" staged=null applied=null health=null id
+  if [[ $(readlink "$TRIGGER" 2>/dev/null) == "$SPOOL/staged" ]]; then
+    staged=$(jq -c '{fingerprint, stagedAt, count}' "$SPOOL/staged/omarchy-auto-update.json" 2>/dev/null) || staged=null
   fi
+  id=$(jq -r '.id // empty' "$SPOOL/result.json" 2>/dev/null || true)
+  if [[ -n $id && $id != "$(cat "$APPLIED_SEEN" 2>/dev/null)" ]]; then
+    applied=$(jq -c . "$SPOOL/result.json" 2>/dev/null) || applied=null
+    if [[ $(jq -r .id "$HEALTH" 2>/dev/null) == "$id" ]]; then
+      health=$(jq -c . "$HEALTH" 2>/dev/null) || health=null
+    fi
+  fi
+  jq -c --argjson staged "${staged:-null}" --argjson applied "${applied:-null}" --argjson health "${health:-null}" \
+    '. + {restartPending: $staged, applied: $applied, health: $health}' <<<"$s" 2>/dev/null || echo "$s"
+}
+
+failed_units() {
+  systemctl "$@" --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+# Called by the runner right before staging, so the check after the restart
+# only counts what broke since.
+baseline() {
+  mkdir -p "$BASE"
+  jq -n --argjson system "$(failed_units)" --argjson user "$(failed_units --user)" \
+    '{system: $system, user: $user}' >"$BASE/failed-before.json"
+}
+
+# After an update installed on restart: did the session come up whole, and what
+# is left to finish. Migrations ship with Omarchy and run as the user, so they
+# could not run during the restart; those that call sudo need the password.
+after_restart() {
+  local id
+  id=$(jq -r '.id // empty' "$SPOOL/result.json" 2>/dev/null || true)
+  if [[ -z $id || $id == "$(cat "$APPLIED_SEEN" 2>/dev/null)" ]]; then
+    echo '{}'
+    return
+  fi
+  local before='{"system": [], "user": []}' hypr=false shell=false
+  [[ -f $BASE/failed-before.json ]] && before=$(cat "$BASE/failed-before.json")
+  hyprctl version >/dev/null 2>&1 && hypr=true
+  pgrep -u "$(id -u)" -x quickshell >/dev/null && shell=true
+  local pending needs=false dir="${OMARCHY_PATH:-/usr/share/omarchy}/migrations" m
+  pending=$(omarchy-migrate --pending 2>/dev/null || true)
+  while IFS= read -r m; do
+    [[ -n $m ]] && grep -qw sudo "$dir/$m" 2>/dev/null && needs=true
+  done <<<"$pending"
+  mkdir -p "$BASE"
+  jq -n --arg id "$id" --argjson before "$before" --argjson system "$(failed_units)" \
+    --argjson user "$(failed_units --user)" --argjson hypr "$hypr" --argjson shell "$shell" \
+    --arg pending "$pending" --argjson needs "$needs" --argjson at "$(now)" '
+    ($system - ($before.system // [])) as $newSystem | ($user - ($before.user // [])) as $newUser |
+    {id: $id, at: $at, hyprland: $hypr, shell: $shell, failed: ($newSystem + $newUser),
+     ok: ($hypr and $shell and ($newSystem + $newUser | length) == 0),
+     migrations: ($pending | split("\n") | map(select(length > 0))), needsPassword: $needs}' >"$HEALTH.tmp"
+  mv -f "$HEALTH.tmp" "$HEALTH"
+  cat "$HEALTH"
+}
+
+ack_applied() {
+  local id
+  id=$(jq -r '.id // empty' "$SPOOL/result.json" 2>/dev/null || true)
+  [[ -n $id ]] && { mkdir -p "$BASE"; echo "$id" >"$APPLIED_SEEN"; }
+  return 0
 }
 
 ack_news() {
@@ -307,6 +386,9 @@ case "$cmd" in
   status) status ;;
   ack-news) ack_news ;;
   ack-run) ack_run ;;
+  after-restart) after_restart ;;
+  ack-applied) ack_applied ;;
+  baseline) baseline ;;
   update-now) update_now ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown command: $cmd (see --help)" ;;

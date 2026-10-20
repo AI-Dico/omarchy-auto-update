@@ -1,7 +1,8 @@
 #!/bin/bash
 echo "== omarchy-snapshot"
+# Like real sudo, the prompt is translated unless SUDO_PROMPT pins it.
 case omarchy-snapshot in
-  omarchy-snapshot) read -t 3 -rsp "[sudo] password for tester: " pw; echo; [[ $pw == test ]] && echo "snapshot ok" || { echo "Sorry, try again."; exit 1; } ;;
+  omarchy-snapshot) prompt=${SUDO_PROMPT:-"[sudo] tester의 암호: "}; read -t 3 -rsp "${prompt//%p/tester}" pw; echo; [[ $pw == test ]] && echo "snapshot ok" || { echo "Sorry, try again."; exit 1; } ;;
   omarchy-update-system-pkgs) for i in 1 2 3; do echo "($i/3) upgrading pkg$i"; sleep 0.4; done ;;
   *) sleep 0.6 ;;
 esac

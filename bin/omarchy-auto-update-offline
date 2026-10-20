@@ -1,0 +1,663 @@
+#!/usr/bin/python3 -I
+"""Install a prepared update while the computer restarts (systemd offline update).
+
+  omarchy-auto-update-offline stage <fingerprint> <cache-dir>   root, via sudo, after consent
+  omarchy-auto-update-offline cancel                            root, drop a staged update
+  omarchy-auto-update-offline apply                             root, from system-update.target
+
+`stage` runs once the user has agreed. As root it syncs its own copy of the
+package databases from the mirrors, plans the whole upgrade from them, and goes
+on only if that plan is exactly the set the user agreed to (same fingerprint),
+package signatures are required, and nothing would be removed by a replacement
+or conflict. Only the package files come from the user's background download:
+each is opened without following links, must be a regular file of that user,
+must have exactly the size the database gives, and pacman checks its signature
+before anything is staged. Then it installs this script and its unit where only
+root can write, and points /system-update at the staged set.
+
+`apply` runs on the next boot, inside system-update.target. The unit removes the
+trigger before this script starts and reboots whatever happens, so a failure
+can never loop. It checks the set again against the system as it is now, saves
+a restore point and puts it in the boot menu, installs the set from the cache,
+and records the result for the first login.
+"""
+import hashlib, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time
+
+# Read once, first: this is what gets installed as root, so it must be the code
+# that is running now, not whatever the file holds a moment later.
+try:
+    with open(os.path.realpath(__file__), "rb") as _self:
+        SELF = _self.read()
+except OSError:
+    SELF = b""
+
+LIBEXEC = "/usr/local/libexec/omarchy-auto-update"
+INSTALLED = os.path.join(LIBEXEC, "offline")
+UNIT_NAME = "omarchy-auto-update-offline.service"
+UNIT = os.path.join("/etc/systemd/system", UNIT_NAME)
+WANTS = os.path.join("/etc/systemd/system/system-update.target.wants", UNIT_NAME)
+SPOOL = "/var/lib/omarchy-auto-update"
+STAGED = os.path.join(SPOOL, "staged")
+REQUEST_NAME = "omarchy-auto-update.json"  # also how the unit recognises its own trigger
+REQUEST = os.path.join(STAGED, REQUEST_NAME)
+RESULT = os.path.join(SPOOL, "result.json")
+APPLY_LOG = os.path.join(SPOOL, "apply.log")
+PREV_SYNC = os.path.join(SPOOL, "prev-sync")
+TRIGGER = "/system-update"
+PACMAN_SYNC = "/var/lib/pacman/sync"
+PACMAN_LOCAL = "/var/lib/pacman/local"
+PKG_CACHE = "/var/cache/pacman/pkg"
+VALID_SECONDS = 3 * 24 * 3600  # same as the background check
+MIN_FREE_BYTES = 10 * 1024 ** 3  # same floor as omarchy update
+OVERWRITE = "/usr/share/omarchy/*"  # as omarchy-update-system-pkgs
+KEYRINGS = ("archlinux-keyring", "omarchy-keyring")
+SAFE_NAME = re.compile(r"^[A-Za-z0-9@._+-]+$")
+PKG_NAME = re.compile(r"^[A-Za-z0-9@._+-]+\.pkg\.tar(\.(zst|xz|gz|bz2|lz4|lrz|lzo|Z))?$")
+PACMAN_ENV = dict(os.environ, LC_ALL="C", OMARCHY_UPDATE_PACMAN="1")
+# With --noconfirm pacman answers its own questions. A conflict already stops
+# the transaction; these would go ahead unseen, so they get "no" instead:
+# installing an IgnorePkg package (1), replacing an installed one (2),
+# importing a signing key (64).
+ASK_NO = "67"
+
+UNIT_TEXT = f"""[Unit]
+Description=Install prepared Omarchy updates
+Documentation=https://github.com/AI-Dico/omarchy-auto-update
+DefaultDependencies=no
+Requires=sysinit.target
+# limine-snapper-sync asks snapperd over D-Bus to put the restore point in the
+# boot menu; nothing else here needs it.
+Wants=dbus.socket
+After=sysinit.target system-update-pre.target local-fs.target dbus.socket
+Before=system-update.target shutdown.target
+Conflicts=shutdown.target
+# Only a trigger that points at our staged set; another updater's is left alone
+# (a failed condition skips the unit without the reboot actions below).
+ConditionPathIsSymbolicLink={TRIGGER}
+ConditionPathExists={TRIGGER}/{REQUEST_NAME}
+# Whatever happens below, the computer then starts normally: the trigger is
+# gone before any of this unit's own code runs.
+SuccessAction=reboot
+FailureAction=reboot
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/rm -f {TRIGGER}
+ExecStart={INSTALLED} apply
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+StandardError=journal+console
+"""
+
+
+class Stop(Exception):
+    """A planned stop with a message for the user."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def out(**fields):
+    print(json.dumps(fields), flush=True)
+
+
+def run(argv, timeout=None, **kw):
+    """subprocess.run in its own process group, killed whole on timeout."""
+    p = subprocess.Popen(argv, start_new_session=True, **kw)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, p.returncode, stdout, stderr)
+
+
+def fsync_write(path, data, mode=0o644):
+    """Write `data` (bytes) to `path` atomically and durably."""
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(os.path.dirname(path))
+
+
+def fsync_dir(path):
+    """Make renames and new names in `path` survive a power cut."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json(path, data):
+    fsync_write(path, json.dumps(data).encode())
+
+
+def fingerprint(plan):
+    """sha256 over the sorted "name version" lines of the full transaction.
+    The background check computes the same thing from its own plan."""
+    return hashlib.sha256("\n".join(sorted(f"{p[0]} {p[1]}" for p in plan)).encode()).hexdigest()
+
+
+def repos():
+    names = run(["pacman-conf", "--repo-list"], 30, stdout=subprocess.PIPE, text=True).stdout.split()
+    for name in names:
+        if not SAFE_NAME.match(name):
+            raise Stop(5, f"Unexpected repository name: {name!r}")
+    return names
+
+
+def package_policy(tokens, policy):
+    for tok in tokens:
+        if tok in ("Never", "Optional", "Required"):
+            policy = tok
+        elif tok in ("PackageNever", "PackageOptional", "PackageRequired"):
+            policy = tok[len("Package"):]
+    return policy
+
+
+def require_signatures(names):
+    """Every repository must require package signatures; otherwise a package in
+    the user's cache could be swapped for one nobody signed."""
+    conf = lambda *a: run(["pacman-conf", *a], 30, stdout=subprocess.PIPE, text=True).stdout.split()
+    default = package_policy(conf("SigLevel"), "Required")
+    for name in names:
+        if package_policy(conf("-r", name, "SigLevel"), default) != "Required":
+            raise Stop(11, f"The {name} repository doesn't require package signatures, "
+                           "so updates can't be installed on restart. Use Omarchy's updater.")
+
+
+def temp_dbpath(sync_dir):
+    tmp = tempfile.mkdtemp(prefix="db.", dir=SPOOL)
+    os.chmod(tmp, 0o755)  # pacman downloads as its unprivileged DownloadUser
+    os.symlink(PACMAN_LOCAL, os.path.join(tmp, "local"))
+    os.symlink(sync_dir, os.path.join(tmp, "sync"))
+    return tmp
+
+
+def plan_with(sync_dir):
+    """The full -Su transaction against `sync_dir` and the installed system,
+    as [(name, version, filename, size)]. Raises Stop if pacman can't plan it.
+    An empty cache dir makes pacman report each package's full size."""
+    tmp = temp_dbpath(sync_dir)
+    empty = os.path.join(tmp, "cache")
+    os.mkdir(empty)
+    try:
+        p = run(["pacman", "-Su", "--print", "--print-format", "%n %v %f %s", "--noconfirm",
+                 "--dbpath", tmp, "--cachedir", empty, "--logfile", "/dev/null"], 120,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=PACMAN_ENV)
+        if p.returncode != 0:
+            raise Stop(4, "This update needs a decision. Run Omarchy's updater to see it.\n" + p.stderr[-500:])
+        plan = []
+        for line in p.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            name, version, filename, size = parts
+            if not SAFE_NAME.match(name) or not PKG_NAME.match(filename) or not size.isdigit():
+                raise Stop(5, f"Unexpected package entry: {line!r}")
+            plan.append((name, version, filename, int(size)))
+        return plan
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def removals(sync_dir, plan):
+    """Installed packages the transaction would remove through a replacement
+    or a conflict. Neither shows in the plan or its fingerprint, and pacman
+    would answer the question itself, so such a set goes to Omarchy's updater."""
+    tmp = temp_dbpath(sync_dir)
+    try:
+        names = [p[0] for p in plan]
+        si = run(["pacman", "-Si", "--dbpath", tmp, *names], 60,
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=PACMAN_ENV)
+        q = run(["pacman", "-Q"], 60, stdout=subprocess.PIPE, text=True, env=PACMAN_ENV)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if si.returncode != 0 or q.returncode != 0:
+        raise Stop(5, "Couldn't read the package details")
+    installed = dict(line.split()[:2] for line in q.stdout.splitlines() if len(line.split()) >= 2)
+    gone, current = set(), None
+    for line in si.stdout.splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key == "Name":
+            current = value.strip()
+        elif key in ("Replaces", "Conflicts With") and value.strip() != "None":
+            for dep in value.split():
+                m = re.match(r"^([^<>=]+)(<=|>=|<|>|=)?(.*)$", dep)
+                name, op, want = m.group(1), m.group(2), m.group(3)
+                if name not in installed or name == current or name in names:
+                    continue
+                if op and not version_matches(installed[name], op, want):
+                    continue
+                gone.add(name)
+    # Conflicts through provided names, or declared by installed packages,
+    # aren't seen here; pacman refuses those at install time (see ASK_NO).
+    return sorted(gone)
+
+
+def version_matches(have, op, want):
+    c = int(run(["vercmp", have, want], 10, stdout=subprocess.PIPE, text=True).stdout.strip() or "0")
+    return {"<": c < 0, "<=": c <= 0, "=": c == 0, ">=": c >= 0, ">": c > 0}[op]
+
+
+# --- stage -------------------------------------------------------------------
+
+def open_user_dir(path, uid, parent_fd=None):
+    """A directory owned by `uid`, opened without following a link."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    st = os.fstat(fd)
+    if st.st_uid != uid:
+        os.close(fd)
+        raise Stop(5, f"{path} is not the user's own directory")
+    return fd
+
+
+def copy_package(dir_fd, name, uid, size, dest):
+    """Copy a downloaded package into the root-owned cache: a regular file of
+    `uid`, exactly `size` bytes long, still exactly that long at the end."""
+    try:
+        src = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise Stop(5, f"{name} was not downloaded")
+    except OSError as e:
+        raise Stop(5, f"Couldn't open {name}: {e.strerror}")
+    tmp = f"{dest}.oau-part"
+    try:
+        st = os.fstat(src)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+            raise Stop(5, f"{name} is not a regular file of the user")
+        if st.st_size != size:
+            raise Stop(5, f"{name} doesn't have the expected size")
+        dst = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+        try:
+            os.fchmod(dst, 0o644)
+            left = size
+            while left:
+                chunk = os.read(src, min(left, 1 << 20))
+                if not chunk:
+                    raise Stop(5, f"{name} got shorter while being copied")
+                left -= len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(dst, view):]
+            if os.read(src, 1):
+                raise Stop(5, f"{name} grew while being copied")
+            os.fsync(dst)
+        finally:
+            os.close(dst)
+        os.replace(tmp, dest)
+        tmp = None
+    finally:
+        os.close(src)
+        if tmp and os.path.lexists(tmp):
+            os.unlink(tmp)
+
+
+def install_self():
+    """This script and its unit, where only root can write."""
+    if not SELF:
+        raise Stop(5, "Couldn't read the installer itself")
+    os.makedirs(LIBEXEC, mode=0o755, exist_ok=True)
+    fsync_write(INSTALLED, SELF, 0o755)
+    fsync_write(UNIT, UNIT_TEXT.encode())
+    os.makedirs(os.path.dirname(WANTS), exist_ok=True)
+    if os.path.lexists(WANTS):
+        os.unlink(WANTS)
+    os.symlink(UNIT, WANTS)
+    run(["systemctl", "daemon-reload"], 120)
+
+
+def ours():
+    try:
+        return os.readlink(TRIGGER) == STAGED
+    except OSError:
+        return False
+
+
+def stage(agreed, cache_dir):
+    uid = int(os.environ.get("SUDO_UID", "-1"))
+    if uid <= 0:
+        raise Stop(2, "Run this through sudo from the Auto Update plugin")
+    if not re.fullmatch(r"[0-9a-f]{64}", agreed):
+        raise Stop(2, "Bad fingerprint")
+    if os.path.lexists(TRIGGER) and not ours():
+        raise Stop(6, "Another update is already waiting for a restart")
+    if not os.path.isabs(cache_dir):
+        raise Stop(2, "The cache path must be absolute")
+
+    names = repos()
+    require_signatures(names)
+    os.makedirs(SPOOL, mode=0o755, exist_ok=True)
+    os.chmod(SPOOL, 0o755)
+    work = tempfile.mkdtemp(prefix="staged.", dir=SPOOL)
+    os.chmod(work, 0o755)
+    fds = []
+    try:
+        # Root's own copy of the databases, straight from the mirrors: nothing
+        # the user's account could have written decides what gets installed.
+        sync_dir = os.path.join(work, "sync")
+        os.mkdir(sync_dir, 0o755)
+        tmp = temp_dbpath(sync_dir)
+        try:
+            p = run(["pacman", "-Sy", "--dbpath", tmp, "--logfile", "/dev/null"], 600,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=PACMAN_ENV)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if p.returncode != 0:
+            raise Stop(5, "Couldn't reach the package mirrors.\n" + p.stderr[-300:])
+
+        plan = plan_with(sync_dir)
+        if not plan:
+            raise Stop(3, "There is nothing to install")
+        if fingerprint(plan) != agreed:
+            raise Stop(3, "The updates changed since you agreed. Please review them again.")
+        gone = removals(sync_dir, plan)
+        if gone:
+            raise Stop(4, "This update replaces or removes " + ", ".join(gone[:5])
+                       + ". Run Omarchy's updater to decide.")
+
+        need = sum(p[3] for p in plan)
+        if shutil.disk_usage("/").free < MIN_FREE_BYTES + need:
+            raise Stop(7, "Not enough free space: Omarchy needs 10 GB free to update safely")
+
+        # Into the system package cache: its own subvolume, so the snapshot
+        # taken before installing does not hold on to the packages.
+        base = open_user_dir(cache_dir, uid); fds.append(base)
+        pkg = open_user_dir("pkg", uid, base); fds.append(pkg)
+        for _, _, filename, size in plan:
+            dest = os.path.join(PKG_CACHE, filename)
+            if not (os.path.isfile(dest) and not os.path.islink(dest)):
+                copy_package(pkg, filename, uid, size, dest)
+            # The detached signature pacman checks it against, when the
+            # database doesn't carry one; without it pacman fetches it all again.
+            sig, sig_dest = filename + ".sig", dest + ".sig"
+            if not os.path.isfile(sig_dest):
+                try:
+                    st = os.stat(sig, dir_fd=pkg, follow_symlinks=False)
+                except FileNotFoundError:
+                    st = None
+                if st and st.st_size <= 64 * 1024:
+                    copy_package(pkg, sig, uid, st.st_size, sig_dest)
+
+        # Check every signature now, so a bad file stops here and not at boot.
+        tmp = temp_dbpath(sync_dir)
+        try:
+            p = run(["pacman", "-Suw", "--noconfirm", "--dbpath", tmp, "--cachedir", PKG_CACHE,
+                     "--logfile", "/dev/null"], 900, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True, env=PACMAN_ENV)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if p.returncode != 0:
+            if any(n in KEYRINGS for n, *_ in plan):
+                raise Stop(4, "This update brings new signing keys. Run Omarchy's updater to install it.")
+            raise Stop(5, "A package didn't pass verification.\n" + p.stderr[-500:])
+
+        write_json(os.path.join(work, REQUEST_NAME), {
+            "fingerprint": agreed, "stagedAt": int(time.time()), "count": len(plan),
+            "packages": [f"{n} {v}" for n, v, _, _ in plan]})
+        install_self()
+
+        # Swap the staged set in, then point the trigger at it.
+        if os.path.lexists(TRIGGER):
+            os.unlink(TRIGGER)
+        old = None
+        if os.path.isdir(STAGED):
+            old = tempfile.mkdtemp(prefix="old.", dir=SPOOL)
+            os.rename(STAGED, os.path.join(old, "s"))
+        os.rename(work, STAGED)
+        work = None
+        if old:
+            shutil.rmtree(old, ignore_errors=True)
+        tmp_link = f"{TRIGGER}.oau"
+        if os.path.lexists(tmp_link):
+            os.unlink(tmp_link)
+        os.symlink(STAGED, tmp_link)
+        os.rename(tmp_link, TRIGGER)
+        os.sync()
+        out(ok=True, staged=True, count=len(plan))
+    finally:
+        for fd in fds:
+            os.close(fd)
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def cancel():
+    if ours():
+        os.unlink(TRIGGER)
+    shutil.rmtree(STAGED, ignore_errors=True)
+    out(ok=True, cancelled=True)
+
+
+# --- apply -------------------------------------------------------------------
+
+def say(log, text):
+    """To the console, the journal, the boot splash and the log."""
+    try:
+        print(text, flush=True)
+        log.write(text + "\n")
+        log.flush()
+        if shutil.which("plymouth"):
+            run(["plymouth", "display-message", f"--text={text}"], 5,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # telling the user must never change the outcome
+
+
+def snapshot(log, label):
+    """Restore points of every Snapper config, as ({config: number}, in boot
+    menu). Without Snapper there is none, as in omarchy-snapshot; with it, a
+    restore point that can't be made or reached from the boot menu stops the
+    update before anything changes."""
+    if not shutil.which("snapper"):
+        return {}, False
+    p = run(["snapper", "--no-dbus", "--csvout", "list-configs"], 120, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise Stop(10, "Couldn't save a restore point, so nothing was installed.")
+    configs = [line.split(",")[0] for line in p.stdout.splitlines()[1:]]
+    taken = {}
+    for config in configs:
+        if not SAFE_NAME.match(config):
+            continue
+        s = run(["snapper", "--no-dbus", "-c", config, "create", "-c", "number", "-p", "-d", label], 600,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if s.returncode != 0 or not s.stdout.strip().isdigit():
+            log.write(f"snapshot of {config} failed: {s.stderr.strip()}\n")
+            raise Stop(10, "Couldn't save a restore point, so nothing was installed.")
+        taken[config] = int(s.stdout.strip())
+        run(["snapper", "--no-dbus", "-c", config, "cleanup", "number"], 600,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The watcher that adds snapshots to the boot menu isn't running here.
+    in_menu = False
+    if taken and shutil.which("limine-snapper-sync"):
+        log.flush()
+        try:
+            in_menu = run(["limine-snapper-sync"], 300, stdout=log, stderr=log).returncode == 0
+        except subprocess.TimeoutExpired:
+            in_menu = False
+        if not in_menu:
+            raise Stop(10, "Couldn't add the restore point to the boot menu, so nothing was installed.")
+    return taken, in_menu
+
+
+def sync_files(names, directory):
+    return [f for n in names for f in (f"{n}.db", f"{n}.db.sig") if os.path.isfile(os.path.join(directory, f))]
+
+
+def swap_sync_dbs(names, src):
+    """Put the staged databases (and their signatures) in place. The current
+    ones are copied out first, durably, with a list of what existed, so they
+    can be put back exactly."""
+    shutil.rmtree(PREV_SYNC, ignore_errors=True)
+    os.mkdir(PREV_SYNC, 0o755)
+    existed = sync_files(names, PACMAN_SYNC)
+    for f in existed:
+        with open(os.path.join(PACMAN_SYNC, f), "rb") as fh:
+            fsync_write(os.path.join(PREV_SYNC, f), fh.read())
+    write_json(os.path.join(PREV_SYNC, "existed.json"), existed)  # last: marks the backup complete
+    staged = set(sync_files(names, src))
+    for f in [x for x in (f"{n}.db.sig" for n in names) if x in existed and x not in staged]:
+        os.unlink(os.path.join(PACMAN_SYNC, f))  # a signature of the old database
+    for f in sorted(staged):
+        with open(os.path.join(src, f), "rb") as fh:
+            fsync_write(os.path.join(PACMAN_SYNC, f), fh.read())
+
+
+def restore_sync_dbs(names):
+    try:
+        with open(os.path.join(PREV_SYNC, "existed.json")) as f:
+            existed = json.load(f)
+    except (OSError, ValueError):
+        return  # the backup never completed, so nothing was swapped yet
+    for f in sync_files(names, PACMAN_SYNC):
+        if f not in existed:
+            os.unlink(os.path.join(PACMAN_SYNC, f))
+    for f in existed:
+        with open(os.path.join(PREV_SYNC, f), "rb") as fh:
+            fsync_write(os.path.join(PACMAN_SYNC, f), fh.read())
+
+
+def pacman_log():
+    path = run(["pacman-conf", "LogFile"], 30, stdout=subprocess.PIPE, text=True).stdout.strip()
+    return path or "/var/log/pacman.log"
+
+
+def log_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def committed_since(path, offset):
+    """Did pacman start changing the system after `offset` in its log? Its
+    "transaction started" line comes before any package or scriptlet runs."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return b"[ALPM] transaction started" in f.read()
+    except OSError:
+        return True  # can't tell: assume it did
+
+
+def pacman(log, args):
+    log.flush()
+    p = run(["pacman", *args, "--noconfirm", "--ask", ASK_NO, "--cachedir", PKG_CACHE], None,
+            stdout=log, stderr=subprocess.PIPE, text=True, env=PACMAN_ENV)
+    log.write(p.stderr)
+    log.flush()
+    return p
+
+
+def apply():
+    # The unit has already removed the trigger.
+    started = int(time.time())
+    result = {"at": started, "ok": False}
+    names, swapped, plog, offset, warnings = [], False, None, 0, []
+    fd = os.open(APPLY_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    log = os.fdopen(fd, "w")
+    try:
+        with open(REQUEST) as f:
+            request = json.load(f)
+        agreed = str(request.get("fingerprint", ""))
+        result.update(id=f"{agreed[:12]}-{started}", fingerprint=agreed, count=request.get("count", 0))
+        say(log, "Installing updates. Please don't turn off your computer.")
+        if started - int(request.get("stagedAt", 0)) > VALID_SECONDS:
+            raise Stop(8, "The prepared updates were too old, so nothing was installed.")
+        names = repos()
+        sync_dir = os.path.join(STAGED, "sync")
+        plan = plan_with(sync_dir)
+        if fingerprint(plan) != agreed:
+            raise Stop(3, "The system changed since the updates were prepared, so nothing was installed.")
+        missing = [p[2] for p in plan if not os.path.isfile(os.path.join(PKG_CACHE, p[2]))]
+        if missing:
+            raise Stop(5, f"{len(missing)} prepared packages were missing, so nothing was installed.")
+        # Same packages can still mean new removals if something was installed since.
+        gone = removals(sync_dir, plan)
+        if gone:
+            raise Stop(4, "This update now replaces or removes " + ", ".join(gone[:5])
+                       + ", so nothing was installed. Run Omarchy's updater to decide.")
+
+        say(log, "Saving a restore point…")
+        result["snapshots"], result["bootMenu"] = snapshot(log, f"Auto Update {agreed[:12]}")
+        say(log, f"Installing {len(plan)} updates…")
+        plog = pacman_log()
+        offset = log_size(plog)
+        swapped = True
+        swap_sync_dbs(names, sync_dir)
+        # New signing keys first, as omarchy-update-keyring does, so the rest
+        # is checked against them.
+        keyrings = [n for n, *_ in plan if n in KEYRINGS]
+        steps = ([["-S", "--needed", *keyrings]] if keyrings else []) + [["-Su", "--overwrite", OVERWRITE]]
+        for args in steps:
+            p = pacman(log, args)
+            # pacman doesn't fail on a failing hook (initramfs, boot entries); say so.
+            warnings += [l for l in p.stderr.splitlines() if "failed to execute correctly" in l]
+            if p.returncode != 0:
+                raise Stop(9, "The updates couldn't be installed. " + (p.stderr.strip().splitlines() or [""])[-1])
+        result.update(ok=True, state="installed", warnings=warnings[:10])
+        say(log, "Updates installed. Restarting…")
+    except Stop as e:
+        result.update(state="skipped" if e.code in (3, 8) else "failed", message=str(e))
+        say(log, str(e))
+    except Exception as e:  # still ends in a normal boot
+        if not result["ok"]:
+            result.update(state="failed", message=f"Unexpected error: {e}")
+            say(log, result["message"])
+    finally:
+        if swapped and not result["ok"]:
+            if plog is None or committed_since(plog, offset):
+                # Some packages went in before the error: the new databases
+                # describe them, and the restore point is the way back.
+                result.update(state="partial", message="Some updates were installed before an error.")
+            else:
+                try:
+                    restore_sync_dbs(names)
+                except OSError as e:
+                    result["message"] = (result.get("message") or "") + f" Couldn't put the package lists back: {e}"
+        result["finishedAt"] = int(time.time())
+        write_json(RESULT, result)
+        shutil.rmtree(STAGED, ignore_errors=True)
+        shutil.rmtree(PREV_SYNC, ignore_errors=True)
+        log.close()
+        os.sync()
+    return 0  # the unit reboots either way
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if os.geteuid() != 0:
+        out(ok=False, error="This needs root")
+        return 2
+    os.umask(0o022)
+    try:
+        if cmd == "stage" and len(sys.argv) == 4:
+            stage(sys.argv[2], sys.argv[3])
+        elif cmd == "cancel":
+            cancel()
+        elif cmd == "apply":
+            return apply()
+        else:
+            out(ok=False, error="usage: omarchy-auto-update-offline stage <fingerprint> <cache-dir> | cancel | apply")
+            return 2
+    except Stop as e:
+        out(ok=False, error=str(e), code=e.code)
+        return e.code
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

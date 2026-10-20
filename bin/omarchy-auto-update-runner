@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Run Omarchy's own updater without a terminal on screen.
+"""Run Omarchy's own updater, or stage an update for the next restart, without a
+terminal on screen.
 
-  omarchy-auto-update-runner <expected-count> <expected-tier>
+  omarchy-auto-update-runner <fingerprint>            update now (omarchy update -y)
+  omarchy-auto-update-runner --stage <fingerprint>    install on the next restart
+  omarchy-auto-update-runner --finish [--password]    after that restart: migrations
+                                                      and the post-update hook
 
 1. In the foreground, talking to the overlay over stdin/stdout:
    {"type": "password", "retry": false}   → the overlay writes the password line
    {"type": "changed"}                    → the pending set changed since the user
                                             agreed; nothing was run
    {"type": "detached", "events": path}   → the update now runs on its own
+   --stage stays in the foreground and ends with
+   {"type": "done", "ok": true, "staged": true}
 2. Detached from the shell (Omarchy's updater restarts the shell near the end),
    it runs `omarchy update -y` — Omarchy's unattended mode, which asks nothing —
-   in a hidden pseudo-terminal and appends JSON events to `path`:
+   or, with --finish, `omarchy-migrate` and `omarchy-hook post-update`, in a
+   hidden pseudo-terminal and appends JSON events to `path`:
    {"type": "phase", "id": ..., "label": ...}
    {"type": "progress", "done": 3, "total": 9, "label": "Installing jq"}
    {"type": "log", "line": "..."}
@@ -26,6 +33,8 @@ import ctypes, fcntl, json, os, pty, re, resource, select, signal, subprocess, s
 TEST = os.environ.get("OMARCHY_AUTO_UPDATE_TEST") == "1"  # tests: fake sudo check
 HERE = os.path.dirname(os.path.realpath(__file__))
 HELPER = os.path.join(HERE, "omarchy-auto-update")
+OFFLINE = os.path.join(HERE, "omarchy-auto-update-offline")
+SUDO = "/usr/bin/sudo"  # never a `sudo` found earlier on PATH
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "omarchy-auto-update")
 RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy-auto-update")
 EVENTS = os.path.join(RUNTIME, "run.jsonl")
@@ -80,7 +89,7 @@ def state():
 def check_password(password):
     if TEST:
         return password == "test"
-    p = subprocess.run(["sudo", "-S", "-p", "", "-k", "true"], input=password + "\n",
+    p = subprocess.run([SUDO, "-S", "-p", "", "-k", "true"], input=password + "\n",
                        capture_output=True, text=True)
     return p.returncode == 0
 
@@ -156,17 +165,19 @@ def current_phase(pid):
     return found
 
 
-def foreground():
-    """Password exchange with the overlay. Returns the password or None."""
-    if len(sys.argv) >= 2:
+def foreground(agreed, ask=True):
+    """Re-plan check and password exchange with the overlay. Returns the
+    password, "" when none is needed, or None to stop."""
+    if agreed is not None:
         # Re-plan right before installing: if any package or version changed
         # since the user agreed, show them the new set instead of installing it.
-        agreed = sys.argv[1]
         replan = subprocess.run([HELPER, "run", "--force"], capture_output=True)
         now = state()
         if replan.returncode != 0 or now.get("state") != "ready" or fingerprint(now) != agreed:
             say(type="changed")
             return None
+    if not ask:
+        return ""
     retry = False
     for _ in range(3):
         say(type="password", retry=retry)
@@ -181,33 +192,26 @@ def foreground():
     return None
 
 
-def run_update(password):
-    os.makedirs(CACHE, exist_ok=True)
-    tier = state().get("tier", "")
-    events = open(EVENTS, "a", buffering=1, encoding="utf-8")
-
-    def emit(**event):
-        events.write(json.dumps(event) + "\n")
-
-    env = dict(os.environ, OMARCHY_UPDATE_UNATTENDED="1", TERM="xterm-256color", COLUMNS="120")
-    pid, fd = pty.fork()
+def pty_session(argv, env, password, on_line, watch=None):
+    """Run argv in a hidden pseudo-terminal, typing the password into genuine
+    sudo prompts only. Calls on_line(clean_line) per output line and watch(pid)
+    on every turn. Returns (exit_code, asked_without_password)."""
+    # The terminal device of this run, to match sudo processes against. Read
+    # from our side: a child that is sudo itself is setuid, and its /proc
+    # entries are closed to us.
+    fd, slave = os.openpty()
+    tty_nr = os.fstat(slave).st_rdev
+    # sudo translates its prompt; pin the wording so PROMPT matches in any
+    # language. Every sudo below inherits it unless it passes -p itself.
+    env = dict(env, SUDO_PROMPT="[sudo] password for %p: ")
+    pid = os.fork()
     if pid == 0:
-        os.execvpe("omarchy", ["omarchy", "update", "-y"], env)
-
-    # The terminal device of this run, to match sudo processes against.
-    tty_nr = 0
-    for _ in range(20):
-        try:
-            tty_nr = os.stat(os.readlink(f"/proc/{pid}/fd/0")).st_rdev
-            break
-        except OSError:
-            time.sleep(0.05)
-    fd_log = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd_log, 0o600)
-    log = os.fdopen(fd_log, "w", encoding="utf-8")
+        os.close(fd)
+        os.login_tty(slave)
+        os.execvpe(argv[0], argv, env)
+    os.close(slave)
     secret = password
-    buf, pending, last_phase, seen, status = b"", "", None, set(), None
-    no_snapshot = False
+    buf, pending, status, unanswered = b"", "", None, False
     try:
         while status is None:
             ready, _, _ = select.select([fd], [], [], 0.5)
@@ -220,39 +224,94 @@ def run_update(password):
                     _, status = os.waitpid(pid, 0)
                     break
                 buf = (buf + data)[-512:]
+                if watch:
+                    watch(pid)  # before answering: a step can end right after its prompt
                 if PROMPT.search(buf) and privileged_sudo_owns(fd, tty_nr):
-                    os.write(fd, (secret + "\n").encode())
+                    if secret:
+                        os.write(fd, (secret + "\n").encode())
+                    else:
+                        # Nobody gave a password for this run; stop rather than wait.
+                        unanswered = True
+                        os.killpg(os.getpgid(pid), signal.SIGTERM)
                     buf = b""
                 pending += data.decode(errors="replace")
                 *lines, pending = pending.split("\n")
                 for line in lines:
-                    clean = ANSI.sub("", line).rstrip().replace(secret, "****")
-                    if not clean:
-                        continue
-                    if "without a snapshot" in clean:
-                        no_snapshot = True
-                    log.write(clean + "\n")
-                    emit(type="log", line=clean[:300])
-                    m = PACMAN_STEP.search(clean)
-                    if m:
-                        verb = "Removing" if m.group(3) == "removing" else "Installing"
-                        emit(type="progress", done=int(m.group(1)), total=int(m.group(2)),
-                             label=f"{verb} {m.group(4)}")
-            phase = current_phase(pid)
-            if phase and phase != last_phase:
-                last_phase = phase
-                seen.add(phase[0])
-                emit(type="phase", id=phase[0], label=phase[1])
+                    clean = ANSI.sub("", line).rstrip()
+                    if secret:
+                        clean = clean.replace(secret, "****")
+                    if clean:
+                        on_line(clean)
+            if watch:
+                watch(pid)
             done, st = os.waitpid(pid, os.WNOHANG)
             if done:
                 status = st
     finally:
         secret = password = None
+        os.close(fd)
+    code = os.waitstatus_to_exitcode(status) if status is not None else 1
+    return code, unanswered
+
+
+def open_log():
+    os.makedirs(CACHE, exist_ok=True)
+    fd_log = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd_log, 0o600)
+    return os.fdopen(fd_log, "w", encoding="utf-8")
+
+
+def run_detached(password, finish):
+    """`omarchy update -y`, or with `finish` the steps left after an update
+    installed on restart, appending events for the overlay."""
+    tier = state().get("tier", "")
+    events = open(EVENTS, "a", buffering=1, encoding="utf-8")
+    log = open_log()
+
+    def emit(**event):
+        events.write(json.dumps(event) + "\n")
+
+    env = dict(os.environ, OMARCHY_UPDATE_UNATTENDED="1", TERM="xterm-256color", COLUMNS="120")
+    if finish:
+        argv = ["bash", "-c", "omarchy-migrate && omarchy-hook post-update"]
+    else:
+        argv = ["omarchy", "update", "-y"]
+    last_phase, seen, no_snapshot = None, set(), False
+
+    def on_line(clean):
+        nonlocal no_snapshot
+        if "without a snapshot" in clean:
+            no_snapshot = True
+        log.write(clean + "\n")
+        emit(type="log", line=clean[:300])
+        m = PACMAN_STEP.search(clean)
+        if m:
+            verb = "Removing" if m.group(3) == "removing" else "Installing"
+            emit(type="progress", done=int(m.group(1)), total=int(m.group(2)), label=f"{verb} {m.group(4)}")
+
+    def watch(pid):
+        nonlocal last_phase
+        phase = current_phase(pid)
+        if phase and phase != last_phase:
+            last_phase = phase
+            seen.add(phase[0])
+            emit(type="phase", id=phase[0], label=phase[1])
+
+    try:
+        code, unanswered = pty_session(argv, env, password, on_line, watch)
+    finally:
+        password = None
         log.close()
 
-    code = os.waitstatus_to_exitcode(status) if status is not None else 1
     snapshot = "snapshot" in seen and bool(seen & AFTER_SNAPSHOT) and not no_snapshot
-    if code == 0:
+    if finish:
+        if code == 0:
+            emit(type="done", ok=True, finished=True, log=LOG)
+        else:
+            emit(type="done", ok=False, finished=True, needsPassword=unanswered, log=LOG,
+                 error="A settings step needs your password." if unanswered else
+                 "Updating your settings stopped with an error. Omarchy will offer it again at login.")
+    elif code == 0:
         kernel_gone = not os.path.isdir(f"/usr/lib/modules/{os.uname().release}")
         emit(type="done", ok=True, restart=kernel_gone or tier in ("restart", "major"),
              snapshot=snapshot, log=LOG)
@@ -266,10 +325,46 @@ def run_update(password):
         pass
 
 
+def stage(password, agreed):
+    """Hand the agreed set to the offline installer, as root, in the foreground."""
+    subprocess.run([HELPER, "baseline"], capture_output=True)
+    log = open_log()
+    lines = []
+
+    def on_line(clean):
+        log.write(clean + "\n")
+        lines.append(clean)
+
+    try:
+        code, _ = pty_session([SUDO, OFFLINE, "stage", agreed, CACHE],
+                              dict(os.environ, TERM="dumb"), password, on_line)
+    finally:
+        password = None
+        log.close()
+    reply = {}
+    for line in reversed(lines):
+        try:
+            reply = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if code == 0 and reply.get("ok"):
+        say(type="done", ok=True, staged=True, count=reply.get("count", 0))
+    elif reply.get("code") == 3:
+        say(type="changed")
+    else:
+        say(type="done", ok=False, staged=True, log=LOG,
+            error=reply.get("error") or "The update couldn't be prepared for the restart.")
+
+
 def main():
     harden()
     os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME, 0o700)
+    args = sys.argv[1:]
+    mode = "update"
+    if args and args[0] in ("--stage", "--finish"):
+        mode = args.pop(0)[2:]
     # One update at a time. The detached child keeps this lock for the run.
     lock = os.open(os.path.join(RUNTIME, "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -277,7 +372,19 @@ def main():
     except OSError:
         say(type="detached", events=EVENTS, resumed=True)
         return 0
-    password = foreground()
+    if mode == "stage":
+        if len(args) != 1:
+            say(type="done", ok=False, error="Missing fingerprint")
+            return 2
+        password = foreground(args[0])
+        if password is None:
+            return 1
+        stage(password, args[0])
+        return 0
+    if mode == "finish":
+        password = foreground(None, ask="--password" in args)
+    else:
+        password = foreground(args[0] if args else None)
     if password is None:
         return 1
     # Fresh event log, then leave the shell's process tree.
@@ -296,7 +403,7 @@ def main():
     for stream in (0, 1, 2):
         os.dup2(devnull, stream)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    run_update(password)
+    run_detached(password, mode == "finish")
     os._exit(0)
 
 

@@ -7,9 +7,10 @@ Auto Update does the waiting for you:
 - **Checks, downloads and verifies in the background**, with no password, into a private cache. Nothing on the system changes until you say so.
 - **Tells you in plain words** what is ready, and whether it finishes with a restart (kernel, Qt, Hyprland, drivers, Omarchy itself).
 - **Shows Arch news you should read first.**
-- **Installs without a terminal**: enter your password once, watch a progress window, restart when it says so. Under the hood it runs Omarchy's own `omarchy update -y`, so nothing in Omarchy's update is skipped.
+- **Installs while you restart**, like macOS and Windows: for sets that touch the system's core, choose *Restart to update*, enter your password once, and restart now or later. The computer saves a restore point, installs exactly the set you agreed to, and starts again. Omarchy's own settings steps finish on their own after you log in.
+- **Or installs now without a terminal**: enter your password once and watch a progress window. Under the hood it runs Omarchy's own `omarchy update -y`, so nothing in Omarchy's update is skipped.
 
-Status: early. Restart-time installs and one-click undo are next. Design notes in `docs/`.
+Status: early. One-click undo and quiet installs are next. Design notes in `docs/`.
 
 ## Install
 
@@ -25,7 +26,8 @@ Arch doesn't support partial upgrades, so Auto Update always fetches and judges 
 
 - Downloads use a separate copy of the package databases (`fakeroot pacman --dbpath`), never the system's.
 - Your password goes from the password field to the updater over a pipe, is typed into sudo prompts of that one run, and is never written to disk or logs.
-- The update log is kept at `~/.cache/omarchy-auto-update/last-update.log`.
+- *Restart to update* installs a small root-owned script and a systemd offline-update unit the first time you use it (`/usr/local/libexec/omarchy-auto-update/offline`, `/etc/systemd/system/omarchy-auto-update-offline.service`). As root it fetches its own copy of the package lists, requires package signatures, re-plans the update and stops if the plan isn't the one you agreed to; from your cache it takes only the package files, which must be regular files you own with exactly the expected size. At boot it removes its trigger first, so a failure always ends in a normal boot.
+- The update log is kept at `~/.cache/omarchy-auto-update/last-update.log`; the restart install writes `/var/lib/omarchy-auto-update/apply.log`.
 
 ## License
 
