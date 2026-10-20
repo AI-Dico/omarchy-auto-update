@@ -9,6 +9,7 @@
 #   omarchy-auto-update after-restart   after an update installed on restart: check the
 #                                       session and list what is left to finish
 #   omarchy-auto-update ack-applied     dismiss the result of an update installed on restart
+#   omarchy-auto-update last-applied    the last update installed on restart, for the overlay
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
@@ -352,6 +353,12 @@ ack_applied() {
   return 0
 }
 
+# The last update installed on restart, seen or not: what the overlay's
+# "installed" view shows when the note after it is clicked.
+last_applied() {
+  jq -c 'select(.ok == true)' "$SPOOL/result.json" 2>/dev/null | grep . || echo '{}'
+}
+
 ack_news() {
   local news tmp
   news=$(latest_news)
@@ -388,6 +395,7 @@ case "$cmd" in
   ack-run) ack_run ;;
   after-restart) after_restart ;;
   ack-applied) ack_applied ;;
+  last-applied) last_applied ;;
   baseline) baseline ;;
   update-now) update_now ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;

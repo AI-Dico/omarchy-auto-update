@@ -45,8 +45,14 @@ Item {
   property string view: "details"
   property string runKind: "update"
   property var after: null
+  // The last update installed on restart, for the "installed" view.
+  property var installed: null
   readonly property string runner: decodeURIComponent(String(Qt.resolvedUrl("bin/omarchy-auto-update-runner")).replace(/^file:\/\//, ""))
   property bool awaitingPassword: false
+  // Typed before the runner finished re-checking the set; sent when it asks.
+  property bool passwordQueued: false
+  // Sent and being checked; nothing more to type until the runner asks again.
+  property bool passwordSent: false
   property bool passwordRetry: false
   property string phaseLabel: ""
   property int stepDone: 0
@@ -62,6 +68,10 @@ Item {
     root.showPackages = false
     // A finished run stays on screen until dismissed; an idle overlay starts fresh.
     if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied") root.view = "details"
+    // From the note after an update installed on restart: what it changed.
+    var payload = {}
+    try { payload = JSON.parse(payloadJson || "{}") } catch (e) { }
+    if (payload.view === "installed" && root.view === "details" && !installedProc.running) installedProc.running = true
     root.reload()
     Qt.callLater(function() { keys.forceActiveFocus() })
   }
@@ -94,6 +104,8 @@ Item {
     root.runKind = kind
     root.view = "password"
     root.awaitingPassword = false
+    root.passwordQueued = false
+    root.passwordSent = false
     root.passwordRetry = false
     root.phaseLabel = ""
     root.stepDone = 0
@@ -110,7 +122,10 @@ Item {
   }
 
   function submitPassword() {
-    if (!root.awaitingPassword || passwordField.text === "") return
+    if (passwordField.text === "") return
+    if (!root.awaitingPassword) { root.passwordQueued = true; return }
+    root.passwordQueued = false
+    root.passwordSent = true
     root.awaitingPassword = false
     runProc.write(passwordField.text + "\n")
     passwordField.text = ""
@@ -121,6 +136,8 @@ Item {
 
   function cancelUpdate() {
     passwordField.text = ""
+    root.passwordQueued = false
+    root.passwordSent = false
     if (runProc.running && root.view === "password") runProc.running = false
     root.view = "details"
   }
@@ -206,13 +223,18 @@ Item {
       }
       root.follow(e.events)
     } else if (e.type === "changed") {
+      root.passwordQueued = false
+      passwordField.text = ""
       root.view = "details"
       root.reload()
       root.status = Object.assign({}, root.status, { message: "The updates changed since you looked. Please review them again." })
     } else if (e.type === "password") {
       root.awaitingPassword = true
+      root.passwordSent = false
       root.passwordRetry = !!e.retry
       root.view = "password"
+      if (root.passwordQueued && !e.retry) { root.submitPassword(); return }
+      root.passwordQueued = false
       Qt.callLater(function() { passwordField.forceActiveFocus() })
     } else if (e.type === "phase") {
       root.view = "running"
@@ -229,6 +251,9 @@ Item {
     } else if (e.type === "done") {
       root.result = e
       root.awaitingPassword = false
+      root.passwordQueued = false
+      root.passwordSent = false
+      passwordField.text = ""
       tailProc.running = false
       if (e.finished && e.needsPassword) {
         root.finishUpdate(true)
@@ -249,8 +274,11 @@ Item {
         var body = "Installed while restarting."
         if (a.bootMenu)
           body += " A restore point was saved. If something seems wrong, pick it under Snapshots in the boot menu."
-        Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "15000",
-          (n === 1 ? "1 update installed" : n + " updates installed"), body])
+        // notify-send waits for a click on its own; a click opens this overlay.
+        Quickshell.execDetached(["bash", "-c",
+          '[[ $(notify-send -a "Auto Update" -t 15000 -A default=Open -- "$1" "$2") == default ]] && ' +
+          'omarchy-shell shell summon io.github.ai-dico.auto-update \'{"view":"installed"}\'',
+          "notify", (n === 1 ? "1 update installed" : n + " updates installed"), body])
         return
       }
       root.view = e.cancelled ? "details" : "done"
@@ -358,6 +386,9 @@ Item {
     // Exiting without handing over to a background run means it never started.
     onExited: function(code) {
       root.awaitingPassword = false
+      root.passwordQueued = false
+      root.passwordSent = false
+      passwordField.text = ""
       if (root.view === "password" && code !== 0 && !root.result) root.view = "details"
     }
   }
@@ -375,6 +406,24 @@ Item {
     return "The update finished with warnings"
   }
 
+  function installedTitle() {
+    var n = (root.installed && root.installed.count) || 0
+    return n === 1 ? "1 update installed" : n + " updates installed"
+  }
+
+  function installedText() {
+    var a = root.installed || {}
+    var when = a.at ? new Date(a.at * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat) : ""
+    return "Installed while restarting" + (when ? " on " + when : "") + "."
+  }
+
+  function installedRestore() {
+    var a = root.installed || {}
+    if (!a.bootMenu) return "No restore point was saved for this update."
+    return "If something seems wrong since then, you can go back: restart, choose Snapshots in the boot menu "
+      + "and pick the latest one. When it has started, choose Restore."
+  }
+
   function appliedText() {
     var a = root.status.applied || {}
     var restore = a.snapshots && Object.keys(a.snapshots).length > 0
@@ -387,6 +436,20 @@ Item {
       return lead + "No restore point is available for this update. If something keeps failing, run Omarchy's updater."
     return lead + "To go back to how it was before " + root.snapshotDate() + ", restart, choose Snapshots in the boot menu and pick the latest one. "
       + "When it has started, choose Restore."
+  }
+
+  Process {
+    id: installedProc
+    command: [root.helper, "last-applied"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var a = null
+        try { a = JSON.parse(text) } catch (e) { }
+        if (!a || !a.ok) return
+        root.installed = a
+        if (root.view === "details") root.view = "installed"
+      }
+    }
   }
 
   Process {
@@ -653,11 +716,6 @@ Item {
             }
             Button {
               visible: root.ready && root.restartTier
-              text: "Update now"
-              onClicked: root.updateNow()
-            }
-            Button {
-              visible: root.ready && root.restartTier
               text: "Restart to update"
               iconText: "󰜉"
               bordered: true
@@ -697,14 +755,16 @@ Item {
           Text {
             id: runIcon
             anchors.verticalCenter: parent.verticalCenter
-            text: root.view === "password" ? "\udb80\udf3e"
+            text: root.view === "installed" ? "\udb80\udd34"
+                : (root.view === "password" && !root.passwordSent) ? "\udb80\udf3e"
+                : root.view === "password" ? "\udb81\udc50"
                 : root.view === "running" ? "\udb81\udc50"
                 : (root.result && root.result.ok) ? "\udb80\udd34" : "\udb80\udc26"
             color: (root.view === "done" && root.result && !root.result.ok) ? root.urgent : root.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.displayLarge
             RotationAnimation on rotation {
-              running: root.view === "running" && root.opened
+              running: (root.view === "running" || (root.view === "password" && root.passwordSent)) && root.opened
               from: 0; to: 360; duration: 1200; loops: Animation.Infinite
               onRunningChanged: if (!running) runIcon.rotation = 0
             }
@@ -716,6 +776,8 @@ Item {
               width: parent.width
               textFormat: Text.PlainText
               text: root.view === "applied" ? root.appliedTitle()
+                  : root.view === "installed" ? root.installedTitle()
+                  : (root.view === "password" && root.passwordSent) ? (root.runKind === "stage" ? "Getting ready for the restart…" : "Checking your password…")
                   : root.view === "password" ? (root.runKind === "stage" ? "Enter your password to install updates when you restart"
                       : root.runKind === "finish" ? "One more step to finish the update"
                       : "Enter your password to install updates")
@@ -734,7 +796,10 @@ Item {
               width: parent.width
               textFormat: Text.PlainText
               text: root.view === "applied" ? root.appliedText()
-                  : root.view === "password" ? (root.passwordRetry ? "That password didn't work. Try again."
+                  : root.view === "installed" ? root.installedText()
+                  : (root.view === "password" && root.passwordSent) ? "This takes a few seconds."
+                  : root.view === "password" ? (root.passwordQueued ? "Checking the updates once more…"
+                      : root.passwordRetry ? "That password didn't work. Try again."
                       : root.runKind === "finish" ? "Omarchy needs to update some settings. This is the password you use to log in."
                       : "This is the password you use to log in.")
                   : root.view === "running" ? "You can keep working. Please don't turn off your computer."
@@ -753,15 +818,43 @@ Item {
 
         TextField {
           id: passwordField
-          visible: root.view === "password"
+          visible: root.view === "password" && !root.passwordSent
           width: parent.width
           password: true
-          placeholderText: root.awaitingPassword ? "Password" : "Getting ready…"
-          enabled: root.awaitingPassword
+          placeholderText: "Password"
+          // Open from the start: the runner re-checks the set first, and
+          // what is typed meanwhile is sent once it asks.
+          enabled: !root.passwordQueued && !root.passwordSent
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           onAccepted: root.submitPassword()
           Keys.onEscapePressed: root.cancelUpdate()
+        }
+
+        // What the last update installed on restart changed, and how to go back
+        Text {
+          visible: root.view === "installed"
+          width: parent.width
+          textFormat: Text.PlainText
+          text: ((root.installed && root.installed.packages) || []).map(function(p) {
+            return p.name + "  " + (p.from ? p.from + " → " : "") + p.to
+          }).join("\n")
+          color: root.foreground
+          opacity: 0.75
+          font.family: "monospace"
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+        Text {
+          visible: root.view === "installed"
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.installedRestore()
+          color: root.foreground
+          opacity: 0.65
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          wrapMode: Text.Wrap
         }
 
         // What didn't come up after the restart
@@ -848,17 +941,24 @@ Item {
           anchors.right: parent.right
           spacing: Style.spacing.md
           Button {
-            visible: root.view === "password"
+            visible: root.view === "password" && !root.passwordSent
             text: "Cancel"
             onClicked: root.cancelUpdate()
           }
           Button {
-            visible: root.view === "password"
+            visible: root.view === "password" && !root.passwordSent
             text: root.runKind === "stage" ? "Continue" : root.runKind === "finish" ? "Finish" : "Install"
             bordered: true
             selected: true
-            enabled: root.awaitingPassword && passwordField.text !== ""
+            enabled: !root.passwordQueued && !root.passwordSent && passwordField.text !== ""
             onClicked: root.submitPassword()
+          }
+          Button {
+            visible: root.view === "installed"
+            text: "Close"
+            bordered: true
+            selected: true
+            onClicked: { root.view = "details"; root.dismiss() }
           }
           Button {
             visible: root.view === "running"

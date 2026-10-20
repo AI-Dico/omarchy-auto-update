@@ -2,4 +2,6 @@
 # Fake `omarchy update -y` for tests: runs the same step commands in order.
 [[ $1 == update && $2 == -y ]] || exit 2
 set -e
+# The runner keeps omarchy-update from re-running itself under `script`.
+echo "logged=${OMARCHY_UPDATE_LOGGED:-}"
 for c in omarchy-update-requires-free-space omarchy-update-pkg-prune omarchy-snapshot omarchy-update-keyring omarchy-update-system-pkgs omarchy-migrate omarchy-update-restart; do "$c"; done

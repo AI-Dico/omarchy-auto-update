@@ -36,6 +36,16 @@ OMARCHY_AUTO_UPDATE_TEST_TRUST=0 drive test
 grep -q 'snapshot ok' <<<"$EVENTS" && no "never types into an untrusted prompt" || ok "never types into an untrusted prompt"
 grep -q '"type": "done", "ok": false' <<<"$EVENTS" && ok "reports the failure" || no "reports the failure"
 
+grep -q 'logged=1' <<<"$LOGTXT" && ok "keeps omarchy-update off a terminal of its own" || no "keeps omarchy-update off a terminal of its own"
+
+echo "2b. prompt that never gets a genuine sudo"
+OMARCHY_AUTO_UPDATE_TEST_TRUST=0 OMARCHY_AUTO_UPDATE_TEST_PROMPT_WAIT=1 FAKE_PROMPT_TIMEOUT=30 drive test
+grep -q "couldn't answer" <<<"$EVENTS" && ok "stops instead of waiting forever" || no "stops instead of waiting forever"
+
+echo "2c. a step that ignores being stopped"
+OMARCHY_AUTO_UPDATE_TEST_TRUST=0 OMARCHY_AUTO_UPDATE_TEST_PROMPT_WAIT=1 FAKE_PROMPT_TIMEOUT=60 FAKE_IGNORE_TERM=1 drive test
+grep -q "couldn't answer" <<<"$EVENTS" && ok "still ends the run" || no "still ends the run"
+
 echo "3. wrong password"
 OMARCHY_AUTO_UPDATE_TEST_TRUST=1 drive wrong test
 grep -q '"retry": true' <<<"$FG" && ok "asks again after a wrong password" || no "asks again after a wrong password"

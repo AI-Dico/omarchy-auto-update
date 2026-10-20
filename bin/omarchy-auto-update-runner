@@ -61,6 +61,9 @@ PHASES = [
 AFTER_SNAPSHOT = {"install", "settings", "finish", "extras", "cleanup", "done"}
 PROMPT = re.compile(rb"(\[sudo\] password for [^:\r\n]*|Password):\s*$")
 PACMAN_STEP = re.compile(r"\(\s*(\d+)/(\d+)\)\s+(installing|upgrading|reinstalling|removing|downgrading)\s+(\S+)")
+PROMPT_WAIT = 30  # seconds a password prompt may wait for a genuine sudo
+if TEST:
+    PROMPT_WAIT = float(os.environ.get("OMARCHY_AUTO_UPDATE_TEST_PROMPT_WAIT", PROMPT_WAIT))
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
 
 
@@ -195,7 +198,8 @@ def foreground(agreed, ask=True):
 def pty_session(argv, env, password, on_line, watch=None):
     """Run argv in a hidden pseudo-terminal, typing the password into genuine
     sudo prompts only. Calls on_line(clean_line) per output line and watch(pid)
-    on every turn. Returns (exit_code, asked_without_password)."""
+    on every turn. Returns (exit_code, asked_without_password, stuck), stuck
+    meaning a prompt no genuine sudo owned was left waiting and the run stopped."""
     # The terminal device of this run, to match sudo processes against. Read
     # from our side: a child that is sudo itself is setuid, and its /proc
     # entries are closed to us.
@@ -211,29 +215,44 @@ def pty_session(argv, env, password, on_line, watch=None):
         os.execvpe(argv[0], argv, env)
     os.close(slave)
     secret = password
-    buf, pending, status, unanswered = b"", "", None, False
+    buf, pending, status, unanswered, stuck = b"", "", None, False, False
+    asked = None  # when the prompt now at the end of the output appeared
+    killed = None  # when this run was told to stop
+    eof = False  # the terminal closed; keep reaping without blocking
+
+    def stop():
+        nonlocal killed
+        if killed is None:
+            killed = time.monotonic()
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
     try:
         while status is None:
-            ready, _, _ = select.select([fd], [], [], 0.5)
+            if eof:
+                time.sleep(0.2)
+                ready = []
+            else:
+                ready, _, _ = select.select([fd], [], [], 0.5)
             if ready:
                 try:
                     data = os.read(fd, 4096)
                 except OSError:
                     data = b""
                 if not data:
-                    _, status = os.waitpid(pid, 0)
-                    break
+                    eof = True
+                    continue
                 buf = (buf + data)[-512:]
                 if watch:
                     watch(pid)  # before answering: a step can end right after its prompt
-                if PROMPT.search(buf) and privileged_sudo_owns(fd, tty_nr):
-                    if secret:
-                        os.write(fd, (secret + "\n").encode())
-                    else:
-                        # Nobody gave a password for this run; stop rather than wait.
-                        unanswered = True
-                        os.killpg(os.getpgid(pid), signal.SIGTERM)
-                    buf = b""
+                # Only a prompt that is still the last thing printed counts:
+                # any output after it means nobody is waiting on it anymore.
+                if not PROMPT.search(buf):
+                    asked = None
+                elif asked is None:
+                    asked = time.monotonic()
                 pending += data.decode(errors="replace")
                 *lines, pending = pending.split("\n")
                 for line in lines:
@@ -242,6 +261,28 @@ def pty_session(argv, env, password, on_line, watch=None):
                         clean = clean.replace(secret, "****")
                     if clean:
                         on_line(clean)
+            # Checked on every turn, not only when output arrives: a prompt
+            # waits in silence, and sudo may own the terminal a moment later.
+            if asked is not None and killed is None:
+                if privileged_sudo_owns(fd, tty_nr):
+                    if secret:
+                        os.write(fd, (secret + "\n").encode())
+                    else:
+                        # Nobody gave a password for this run; stop rather than wait.
+                        unanswered = True
+                        stop()
+                    asked, buf = None, b""
+                elif time.monotonic() - asked > PROMPT_WAIT:
+                    # A prompt this run can't answer safely (a sudo on another
+                    # terminal, or an imitation): stop instead of waiting forever.
+                    stuck = True
+                    stop()
+                    asked, buf = None, b""
+            if killed is not None and time.monotonic() - killed > 5:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
             if watch:
                 watch(pid)
             done, st = os.waitpid(pid, os.WNOHANG)
@@ -250,8 +291,15 @@ def pty_session(argv, env, password, on_line, watch=None):
     finally:
         secret = password = None
         os.close(fd)
+        if killed is not None:
+            # The child leads its own session and group (login_tty); whatever
+            # of it ignored SIGTERM and outlived it goes now.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
     code = os.waitstatus_to_exitcode(status) if status is not None else 1
-    return code, unanswered
+    return code, unanswered, stuck
 
 
 def open_log():
@@ -271,7 +319,11 @@ def run_detached(password, finish):
     def emit(**event):
         events.write(json.dumps(event) + "\n")
 
-    env = dict(os.environ, OMARCHY_UPDATE_UNATTENDED="1", TERM="xterm-256color", COLUMNS="120")
+    # OMARCHY_UPDATE_LOGGED: omarchy-update would otherwise re-run itself under
+    # `script`, on a terminal of its own where this run can't see sudo; the
+    # output is logged here instead.
+    env = dict(os.environ, OMARCHY_UPDATE_UNATTENDED="1", OMARCHY_UPDATE_LOGGED="1",
+               TERM="xterm-256color", COLUMNS="120")
     if finish:
         argv = ["bash", "-c", "omarchy-migrate && omarchy-hook post-update"]
     else:
@@ -298,7 +350,7 @@ def run_detached(password, finish):
             emit(type="phase", id=phase[0], label=phase[1])
 
     try:
-        code, unanswered = pty_session(argv, env, password, on_line, watch)
+        code, unanswered, stuck = pty_session(argv, env, password, on_line, watch)
     finally:
         password = None
         log.close()
@@ -317,7 +369,8 @@ def run_detached(password, finish):
              snapshot=snapshot, log=LOG)
     else:
         emit(type="done", ok=False, snapshot=snapshot, log=LOG,
-             error="The update stopped with an error. Your computer was not restarted.")
+             error="The update stopped at a password prompt it couldn't answer. Run Omarchy's updater to finish it."
+             if stuck else "The update stopped with an error. Your computer was not restarted.")
     events.close()
     try:
         os.unlink(PIDFILE)
@@ -336,7 +389,7 @@ def stage(password, agreed):
         lines.append(clean)
 
     try:
-        code, _ = pty_session([SUDO, OFFLINE, "stage", agreed, CACHE],
+        code, _, _ = pty_session([SUDO, OFFLINE, "stage", agreed, CACHE],
                               dict(os.environ, TERM="dumb"), password, on_line)
     finally:
         password = None
