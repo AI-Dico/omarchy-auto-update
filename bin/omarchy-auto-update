@@ -4,7 +4,8 @@
 #   omarchy-auto-update run [--force]   check, download and verify, then write the state
 #   omarchy-auto-update status          print the last state as JSON
 #   omarchy-auto-update ack-news        mark the current Arch news as read
-#   omarchy-auto-update update-now      open Omarchy's own updater
+#   omarchy-auto-update ack-run         dismiss a finished update
+#   omarchy-auto-update update-now      open Omarchy's own updater (terminal fallback)
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
@@ -33,7 +34,14 @@ now() { date +%s; }
 
 write_state() {
   mkdir -p "$BASE"
-  jq -n "$@" >"$STATE.new" && mv -f "$STATE.new" "$STATE"
+  local tmp
+  tmp=$(mktemp "$BASE/.state.XXXXXX")
+  jq -n "$@" >"$tmp" && mv -f "$tmp" "$STATE"
+}
+
+# Signatures are only "verified" when pacman requires them.
+signatures_required() {
+  ! grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=.*(Never|Optional)' /etc/pacman.conf
 }
 
 # State with no package set: idle reasons and errors.
@@ -98,9 +106,11 @@ run() {
 
   if [[ $force != --force && -f $STATE ]]; then
     local valid
-    valid=$(jq -r '.validUntil // 0' "$STATE" 2>/dev/null || echo 0)
+    # Only a plain integer may reach the arithmetic below.
+    valid=$(jq -r 'if (.validUntil | type) == "number" then (.validUntil | floor) else 0 end' "$STATE" 2>/dev/null || echo 0)
+    [[ $valid =~ ^[0-9]{1,12}$ ]] || valid=0
     # A prepared set stays good until it expires; nothing to redo.
-    if [[ $(jq -r .state "$STATE") == ready ]] && (($(now) < valid)); then
+    if [[ $(jq -r .state "$STATE" 2>/dev/null) == ready ]] && (($(now) < valid)); then
       cat "$STATE"
       return
     fi
@@ -114,8 +124,16 @@ run() {
   fi
 
   # name old -> new, ignoring held packages.
-  local pending
-  pending=$(pacman -Qu --dbpath "$DB" 2>/dev/null | grep -v '\[ignored\]' || true)
+  local pending qu_err
+  qu_err=$(mktemp)
+  pending=$(pacman -Qu --dbpath "$DB" 2>"$qu_err" | grep -v '\[ignored\]' || true)
+  if [[ -s $qu_err ]]; then
+    simple_state error "Couldn't read the package list: $(head -1 "$qu_err")"
+    rm -f "$qu_err"
+    cat "$STATE"
+    return 1
+  fi
+  rm -f "$qu_err"
   if [[ -z $pending ]]; then
     simple_state uptodate "Omarchy is up to date"
     cat "$STATE"
@@ -172,11 +190,12 @@ run() {
   news=$(latest_news)
   seen=$(cat "$NEWS_SEEN" 2>/dev/null || echo 0)
 
-  local state=ready
+  local state=ready verified=false
   [[ -n $waiting ]] && state=waiting
+  [[ $downloaded == true ]] && signatures_required && verified=true
   printf '%s\n' "$pending" | python3 -c '
 import json, re, sys
-pending, plan, restart_re, state, waiting, downloaded, news, seen, now, valid = sys.argv[1:11]
+pending, plan, restart_re, state, waiting, downloaded, news, seen, now, valid, verified = sys.argv[1:12]
 restart = re.compile(restart_re)
 
 packages = []
@@ -215,6 +234,7 @@ out = {
     "count": len(packages),
     "downloadBytes": size,
     "downloaded": downloaded == "true",
+    "verified": verified == "true",
     "checkedAt": int(now),
     "validUntil": int(now) + int(valid),
 }
@@ -223,23 +243,43 @@ if news:
     if int(when) > int(seen or 0):
         out["news"] = {"at": int(when), "title": title, "link": link}
 print(json.dumps(out))
-' "$pending" "$plan" "$RESTART_PATTERN" "$state" "$waiting" "$downloaded" "$news" "$seen" "$(now)" "$VALID_SECONDS" >"$STATE.new"
-  mv -f "$STATE.new" "$STATE"
+' "$pending" "$plan" "$RESTART_PATTERN" "$state" "$waiting" "$downloaded" "$news" "$seen" "$(now)" "$VALID_SECONDS" "$verified" >"$BASE/.state.new"
+  mv -f "$BASE/.state.new" "$STATE"
   cat "$STATE"
 }
 
+RUN_EVENTS="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-auto-update/run.jsonl"
+
 status() {
-  [[ -f $STATE ]] && cat "$STATE" || echo '{"state":"unknown","packages":[],"count":0}'
+  local s='{"state":"unknown","packages":[],"count":0}'
+  [[ -f $STATE ]] && s=$(cat "$STATE")
+  # An update started from the overlay that the user hasn't dismissed yet.
+  if [[ -f $RUN_EVENTS ]]; then
+    jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s"
+  else
+    echo "$s"
+  fi
 }
 
 ack_news() {
-  local news
+  local news tmp
   news=$(latest_news)
   [[ -n $news ]] || return 0
   mkdir -p "$BASE"
+  exec 9>"$LOCK"
+  flock -w 30 9 || die "a check is running; try again"
   cut -f1 <<<"$news" >"$NEWS_SEEN"
-  [[ -f $STATE ]] && jq 'del(.news)' "$STATE" >"$STATE.new" && mv -f "$STATE.new" "$STATE"
+  if [[ -f $STATE ]]; then
+    tmp=$(mktemp "$BASE/.state.XXXXXX")
+    jq 'del(.news)' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE"
+  fi
   status
+}
+
+# Called when the user dismisses a finished update in the overlay.
+ack_run() {
+  [[ -f $RUN_EVENTS ]] && mv -f "$RUN_EVENTS" "$RUN_EVENTS.seen"
+  return 0
 }
 
 update_now() {
@@ -254,6 +294,7 @@ case "$cmd" in
   run) run "${1:-}" ;;
   status) status ;;
   ack-news) ack_news ;;
+  ack-run) ack_run ;;
   update-now) update_now ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown command: $cmd (see --help)" ;;

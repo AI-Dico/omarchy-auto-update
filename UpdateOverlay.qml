@@ -49,12 +49,13 @@ Item {
   property var logLines: []
   property bool showLog: false
   property var result: null
+  property string eventsPath: ""
 
   function open(payloadJson) {
     root.opened = true
     root.showPackages = false
     // A finished run stays on screen until dismissed; an idle overlay starts fresh.
-    if (!runProc.running && root.view !== "done") root.view = "details"
+    if (!runProc.running && !tailProc.running && root.view !== "done") root.view = "details"
     root.reload()
     Qt.callLater(function() { keys.forceActiveFocus() })
   }
@@ -90,6 +91,7 @@ Item {
     root.showLog = false
     root.result = null
     passwordField.text = ""
+    runProc.command = [root.runner, String(root.status.count || 0), String(root.status.tier || "")]
     runProc.running = true
     Qt.callLater(function() { passwordField.forceActiveFocus() })
   }
@@ -102,20 +104,41 @@ Item {
   }
 
   function cancelUpdate() {
+    passwordField.text = ""
     if (runProc.running && root.view === "password") runProc.running = false
     root.view = "details"
   }
 
   function finishRun() {
+    tailProc.running = false
+    Quickshell.execDetached([root.helper, "ack-run"])
     root.view = "details"
     root.result = null
     root.checkNow()
   }
 
+  // Follows the event file of an update that runs on its own (it survives
+  // shell restarts, and Omarchy's updater restarts the shell near the end).
+  function follow(path) {
+    if (!path) return
+    root.eventsPath = path
+    root.view = "running"
+    root.logLines = []
+    tailProc.running = false
+    tailProc.command = ["tail", "-n", "+1", "-F", path]
+    tailProc.running = true
+  }
+
   function onRunnerEvent(line) {
     var e
     try { e = JSON.parse(line) } catch (err) { return }
-    if (e.type === "password") {
+    if (e.type === "detached") {
+      root.follow(e.events)
+    } else if (e.type === "changed") {
+      root.view = "details"
+      root.reload()
+      root.status = Object.assign({}, root.status, { message: "The updates changed since you looked. Please review them again." })
+    } else if (e.type === "password") {
       root.awaitingPassword = true
       root.passwordRetry = !!e.retry
       root.view = "password"
@@ -136,12 +159,14 @@ Item {
       root.result = e
       root.view = e.cancelled ? "details" : "done"
       root.awaitingPassword = false
+      tailProc.running = false
     }
   }
 
   function readNews() {
-    if (!root.status.news) return
-    Quickshell.execDetached(["xdg-open", root.status.news.link])
+    var link = root.status.news ? String(root.status.news.link || "") : ""
+    if (link.indexOf("https://archlinux.org/news/") !== 0) return
+    Quickshell.execDetached(["xdg-open", link])
   }
 
   function ackNews() {
@@ -184,7 +209,7 @@ Item {
   function subtitle() {
     if (status.state === "ready") {
       var parts = []
-      parts.push(status.downloaded ? "Downloaded and verified" : "Verified")
+      parts.push(status.verified ? "Downloaded and verified" : status.downloaded ? "Downloaded" : "Found")
       if (status.downloadBytes) parts.push(mb(status.downloadBytes))
       return parts.join(" · ")
     }
@@ -207,7 +232,11 @@ Item {
     id: statusProc
     command: [root.helper, "status"]
     stdout: StdioCollector {
-      onStreamFinished: { try { root.status = JSON.parse(text) } catch (e) { } }
+      onStreamFinished: {
+        try { root.status = JSON.parse(text) } catch (e) { return }
+        var p = Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy-auto-update/run.jsonl"
+        if (root.status.run && !tailProc.running && !runProc.running) root.follow(p)
+      }
     }
   }
 
@@ -224,6 +253,16 @@ Item {
     id: runProc
     command: [root.runner]
     stdinEnabled: true
+    stdout: SplitParser { onRead: function(line) { root.onRunnerEvent(line) } }
+    // Exiting without handing over to a background run means it never started.
+    onExited: function(code) {
+      root.awaitingPassword = false
+      if (root.view === "password" && code !== 0 && !root.result) root.view = "details"
+    }
+  }
+
+  Process {
+    id: tailProc
     stdout: SplitParser { onRead: function(line) { root.onRunnerEvent(line) } }
   }
 
@@ -527,7 +566,8 @@ Item {
               text: root.view === "password" ? (root.passwordRetry ? "That password didn't work. Try again." : "This is the password you use to log in.")
                   : root.view === "running" ? "You can keep working. Please don't turn off your computer."
                   : (root.result && root.result.ok) ? (root.result.restart ? "Some parts of the system were updated. They take effect after a restart." : "Everything is up to date.")
-                  : ((root.result && root.result.error) || "") + " A restore point was saved before the update."
+                  : ((root.result && root.result.error) || "")
+                    + ((root.result && root.result.snapshot) ? " A restore point was saved before the update." : "")
               color: (root.view === "password" && root.passwordRetry) ? root.urgent : root.foreground
               opacity: (root.view === "password" && root.passwordRetry) ? 1 : 0.65
               font.family: root.fontFamily

@@ -17,7 +17,8 @@ BarWidget {
   property var status: ({ state: "unknown", count: 0 })
 
   readonly property bool hasNews: !!(status && status.news)
-  readonly property bool showIcon: status.state === "ready" || status.state === "attention" || hasNews
+  readonly property bool running: !!(status && status.run)
+  readonly property bool showIcon: running || status.state === "ready" || status.state === "attention" || hasNews
 
   function refresh() {
     if (!checkProc.running) checkProc.running = true
@@ -32,12 +33,14 @@ BarWidget {
   }
 
   function glyph() {
+    if (running) return "\udb81\udc50"                                   // updating
     if (status.state === "attention" || hasNews) return "󰀦"   // alert circle
     if (status.tier === "restart" || status.tier === "major") return "󰜉" // restart
     return "󰇚"                                                 // download
   }
 
   function tooltip() {
+    if (running) return "Updating… click to see progress"
     if (hasNews && status.state !== "ready") return "Arch news to read before updating"
     if (status.state === "attention") return status.message || "Updates need your attention"
     var n = status.count || 0
