@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Run Omarchy's own updater without a terminal on screen.
+
+Runs `omarchy update -y` (its unattended mode, which asks nothing) inside a
+hidden pseudo-terminal and reports progress as JSON lines on stdout for the
+Auto Update overlay:
+
+  {"type": "password", "retry": false}       send the sudo password on stdin
+  {"type": "phase", "id": ..., "label": ...}  the step Omarchy is in
+  {"type": "progress", "done": 3, "total": 9, "label": "Installing jq"}
+  {"type": "log", "line": "..."}              raw output for the Details view
+  {"type": "done", "ok": true, "restart": true, "log": "/path"}
+
+The password is asked for once, up front, kept in memory only, and typed into
+every sudo prompt of this one run. It is never written anywhere. Which step is
+running is read from the live process tree (the omarchy-* command currently
+executing), so it does not depend on the wording of Omarchy's output.
+"""
+import json, os, pty, re, select, signal, subprocess, sys, time
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "omarchy-auto-update")
+LOG = os.path.join(CACHE, "last-update.log")
+
+# Steps of omarchy-update, by the command that runs them. Unknown steps keep the
+# previous label, so a new upstream step never shows something wrong.
+PHASES = [
+    ("omarchy-update-requires-free-space", "space", "Checking free space"),
+    ("omarchy-update-pkg-prune", "prepare", "Getting ready"),
+    ("omarchy-snapshot", "snapshot", "Saving a restore point"),
+    ("omarchy-update-dev", "prepare", "Getting ready"),
+    ("omarchy-update-keyring", "prepare", "Getting ready"),
+    ("omarchy-update-system-pkgs", "install", "Installing updates"),
+    ("omarchy-migrate", "settings", "Updating your settings"),
+    ("omarchy-hook", "finish", "Finishing up"),
+    ("omarchy-update-aur-pkgs", "extras", "Updating extra apps"),
+    ("omarchy-update-mise", "extras", "Updating developer tools"),
+    ("omarchy-update-orphan-pkgs", "cleanup", "Cleaning up"),
+    ("omarchy-update-analyze-logs", "cleanup", "Checking for problems"),
+    ("omarchy-update-restart", "done", "Almost done"),
+]
+SUDO_PROMPT = re.compile(rb"\[sudo\] password for [^:\r\n]*:\s*$|Password:\s*$")
+SUDO_WRONG = re.compile(rb"Sorry, try again")
+PACMAN_STEP = re.compile(r"\(\s*(\d+)/(\d+)\)\s+(installing|upgrading|reinstalling|removing|downgrading)\s+(\S+)")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
+
+
+def emit(**event):
+    sys.stdout.write(json.dumps(event) + "\n")
+    sys.stdout.flush()
+
+
+def read_password(retry):
+    emit(type="password", retry=retry)
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return line.rstrip("\n")
+
+
+TEST = os.environ.get("OMARCHY_AUTO_UPDATE_TEST") == "1"  # tests: fake sudo, no cache seeding
+
+
+def check_password(password):
+    """Validates the password with sudo before anything starts."""
+    if TEST:
+        return password == "test"
+    p = subprocess.run(["sudo", "-S", "-p", "", "-k", "true"], input=password + "\n",
+                       capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def seed_cache(password):
+    """Hands packages Auto Update already verified to pacman's own cache, so the
+    update does not download them again. pacman checks every signature again
+    when it installs them."""
+    if TEST:
+        return
+    pkg = os.path.join(CACHE, "pkg")
+    files = [os.path.join(pkg, f) for f in os.listdir(pkg)] if os.path.isdir(pkg) else []
+    files = [f for f in files if ".pkg.tar." in f]
+    if not files:
+        return
+    subprocess.run(["sudo", "-S", "-p", "", "install", "-m644", "-t", "/var/cache/pacman/pkg/"] + files,
+                   input=password + "\n", capture_output=True, text=True)
+
+
+def descendants(pid):
+    """Command names of every process below pid, deepest last."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append((int(entry), argv))
+    out, stack = [], [pid]
+    while stack:
+        for child, argv in children.get(stack.pop(), []):
+            out.append(argv)
+            stack.append(child)
+    return out
+
+
+def current_phase(pid):
+    names = set()
+    for argv in descendants(pid):
+        for arg in argv[:2]:
+            names.add(os.path.basename(arg))
+    found = None
+    for command, pid_, label in PHASES:
+        if command in names:
+            found = (pid_, label)
+    return found
+
+
+def restart_needed():
+    """True when the running kernel's modules are gone (a new kernel was
+    installed) or the update said a restart is required."""
+    return not os.path.isdir(f"/usr/lib/modules/{os.uname().release}")
+
+
+def main():
+    os.makedirs(CACHE, exist_ok=True)
+    password, retry = None, False
+    for _ in range(3):
+        password = read_password(retry)
+        if password is None:
+            emit(type="done", ok=False, cancelled=True, log=LOG)
+            return 1
+        if check_password(password):
+            break
+        retry, password = True, None
+    if password is None:
+        emit(type="done", ok=False, error="The password was not accepted.", log=LOG)
+        return 1
+
+    emit(type="phase", id="prepare", label="Getting ready")
+    seed_cache(password)
+
+    env = dict(os.environ, OMARCHY_UPDATE_UNATTENDED="1", TERM="xterm-256color", COLUMNS="120")
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("omarchy", ["omarchy", "update", "-y"], env)
+
+    log = open(LOG, "w", encoding="utf-8")
+    buf, pending, last_phase, said_wrong = b"", "", None, False
+    status = None
+    try:
+        while status is None:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    _, status = os.waitpid(pid, 0)
+                    break
+                buf = (buf + data)[-512:]
+                if SUDO_WRONG.search(data) and not said_wrong:
+                    said_wrong = True
+                if SUDO_PROMPT.search(buf):
+                    os.write(fd, (password + "\n").encode())
+                    buf = b""
+                pending += data.decode(errors="replace")
+                *lines, pending = pending.split("\n")
+                for line in lines:
+                    clean = ANSI.sub("", line).rstrip()
+                    if not clean:
+                        continue
+                    log.write(clean + "\n")
+                    emit(type="log", line=clean[:300])
+                    m = PACMAN_STEP.search(clean)
+                    if m:
+                        verb = {"removing": "Removing"}.get(m.group(3), "Installing")
+                        emit(type="progress", done=int(m.group(1)), total=int(m.group(2)),
+                             label=f"{verb} {m.group(4)}")
+            phase = current_phase(pid)
+            if phase and phase != last_phase:
+                last_phase = phase
+                emit(type="phase", id=phase[0], label=phase[1])
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                status = st
+    finally:
+        password = None
+        log.close()
+
+    code = os.waitstatus_to_exitcode(status) if status is not None else 1
+    if code == 0:
+        emit(type="done", ok=True, restart=restart_needed(), log=LOG)
+        return 0
+    emit(type="done", ok=False, error="The update stopped with an error. Your system was not restarted.", log=LOG)
+    return 1
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())

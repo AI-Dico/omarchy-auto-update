@@ -1,0 +1,260 @@
+#!/bin/bash
+# omarchy-auto-update — background update checks for the Omarchy Auto Update plugin.
+#
+#   omarchy-auto-update run [--force]   check, download and verify, then write the state
+#   omarchy-auto-update status          print the last state as JSON
+#   omarchy-auto-update ack-news        mark the current Arch news as read
+#   omarchy-auto-update update-now      open Omarchy's own updater
+#
+# Nothing here needs root or touches the system: the package databases are
+# synced into a private copy and packages are downloaded into a private cache,
+# both under ~/.cache/omarchy-auto-update. Arch does not support partial
+# upgrades, so the whole pending set is always fetched and judged together.
+
+set -euo pipefail
+
+BASE="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-auto-update"
+DB="$BASE/db"
+PKG="$BASE/pkg"
+STATE="$BASE/state.json"
+NEWS_SEEN="$BASE/news-seen"
+LOCK="$BASE/run.lock"
+MIN_FREE_BYTES=$((10 * 1024 * 1024 * 1024)) # same floor as omarchy update
+VALID_SECONDS=$((3 * 24 * 3600))            # re-prepare after three days
+NEWS_URL="https://archlinux.org/feeds/news/"
+
+# A set that touches any of these is installed on restart, never under a
+# running session: kernel and boot chain, core libraries, graphics, the shell
+# and its toolkit, the compositor, and Omarchy itself.
+RESTART_PATTERN='^(linux|linux-[a-z0-9-]+|linux-firmware.*|glibc|systemd|systemd-[a-z-]+|dbus.*|mesa|lib32-mesa|vulkan-.*|nvidia.*|qt6-.*|quickshell.*|hyprland.*|aquamarine|wayland|xdg-desktop-portal.*|limine.*|mkinitcpio.*|grub|omarchy.*|pacman|openssl|cryptsetup|btrfs-progs|snapper)$'
+
+die() { echo "omarchy-auto-update: $*" >&2; exit 1; }
+now() { date +%s; }
+
+write_state() {
+  mkdir -p "$BASE"
+  jq -n "$@" >"$STATE.new" && mv -f "$STATE.new" "$STATE"
+}
+
+# State with no package set: idle reasons and errors.
+simple_state() {
+  local state="$1" message="${2:-}"
+  write_state --arg state "$state" --arg message "$message" --argjson at "$(now)" \
+    '{state: $state, message: $message, checkedAt: $at, packages: [], count: 0}'
+}
+
+on_metered() {
+  local dev metered
+  dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  [[ -n $dev ]] || return 1
+  metered=$(nmcli -t -g GENERAL.METERED dev show "$dev" 2>/dev/null || true)
+  [[ $metered == yes* ]]
+}
+
+# True on a laptop running on battery below 50%. Peripheral batteries (mice,
+# keyboards) report scope=Device and are ignored.
+low_battery() {
+  local b ac_online=0 low=1 found=0
+  for b in /sys/class/power_supply/*; do
+    [[ -f $b/type ]] || continue
+    case "$(cat "$b/type")" in
+      Mains) [[ $(cat "$b/online" 2>/dev/null) == 1 ]] && ac_online=1 ;;
+      Battery)
+        [[ $(cat "$b/scope" 2>/dev/null) == Device ]] && continue
+        found=1
+        (($(cat "$b/capacity" 2>/dev/null || echo 100) >= 50)) && low=0
+        ;;
+    esac
+  done
+  ((found == 1 && ac_online == 0 && low == 1))
+}
+
+sync_db() {
+  mkdir -p "$DB" "$PKG"
+  # Tests point this at a copy of the local database with older versions.
+  ln -sfn "${OMARCHY_AUTO_UPDATE_LOCAL_DB:-/var/lib/pacman/local}" "$DB/local"
+  fakeroot -- pacman -Sy --disable-sandbox-filesystem --dbpath "$DB" --logfile /dev/null >/dev/null 2>&1
+}
+
+# Newest Arch news item as "epoch<TAB>title<TAB>link", or nothing.
+latest_news() {
+  curl -fsSL --max-time 15 "$NEWS_URL" 2>/dev/null | python3 -c '
+import sys, email.utils, xml.etree.ElementTree as ET
+try:
+    item = ET.parse(sys.stdin).getroot().find("channel/item")
+    when = int(email.utils.parsedate_to_datetime(item.findtext("pubDate")).timestamp())
+    title, link = item.findtext("title").strip(), item.findtext("link").strip()
+    print(f"{when}\t{title}\t{link}")
+except Exception:
+    pass
+' || true
+}
+
+run() {
+  local force="${1:-}"
+  mkdir -p "$BASE"
+  exec 9>"$LOCK"
+  flock -n 9 || die "a check is already running"
+
+  if [[ $force != --force && -f $STATE ]]; then
+    local valid
+    valid=$(jq -r '.validUntil // 0' "$STATE" 2>/dev/null || echo 0)
+    # A prepared set stays good until it expires; nothing to redo.
+    if [[ $(jq -r .state "$STATE") == ready ]] && (($(now) < valid)); then
+      cat "$STATE"
+      return
+    fi
+  fi
+
+  simple_state checking "Checking for updates"
+  if ! sync_db; then
+    simple_state error "Couldn't reach the package mirrors"
+    cat "$STATE"
+    return 1
+  fi
+
+  # name old -> new, ignoring held packages.
+  local pending
+  pending=$(pacman -Qu --dbpath "$DB" 2>/dev/null | grep -v '\[ignored\]' || true)
+  if [[ -z $pending ]]; then
+    simple_state uptodate "Omarchy is up to date"
+    cat "$STATE"
+    return
+  fi
+
+  # The full transaction pacman would run, with download sizes. A failure here
+  # means the set needs a human (a conflict or a question) before it can go in.
+  local plan
+  if ! plan=$(fakeroot -- pacman -Su --print --print-format '%n %v %s' --noconfirm \
+    --disable-sandbox-filesystem --dbpath "$DB" --cachedir "$PKG" --logfile /dev/null 2>"$BASE/plan.err"); then
+    write_state --arg message "This update needs a decision. Run Omarchy's updater to see it." \
+      --arg detail "$(tail -3 "$BASE/plan.err")" --argjson at "$(now)" \
+      '{state: "attention", reason: "needs-decision", message: $message, detail: $detail, checkedAt: $at, packages: [], count: 0}'
+    cat "$STATE"
+    return
+  fi
+
+  local free
+  free=$(df --output=avail -B1 / | tail -1 | tr -d ' ')
+  if ((free < MIN_FREE_BYTES)); then
+    simple_state attention "Not enough free space: Omarchy needs 10 GB free to update safely"
+    cat "$STATE"
+    return
+  fi
+
+  local waiting=""
+  if on_metered; then
+    waiting="Waiting for a non-metered connection to download"
+  elif low_battery; then
+    waiting="Waiting for power to download"
+  fi
+
+  local downloaded=false
+  if [[ -z $waiting ]]; then
+    simple_state downloading "Downloading updates"
+    # pacman checks every signature and checksum while downloading.
+    if nice -n 10 ionice -c3 fakeroot -- pacman -Suw --noconfirm --disable-sandbox-filesystem \
+      --dbpath "$DB" --cachedir "$PKG" --logfile /dev/null >"$BASE/download.log" 2>&1; then
+      downloaded=true
+    else
+      write_state --arg message "Download or verification failed. It will be retried." \
+        --arg detail "$(tail -3 "$BASE/download.log")" --argjson at "$(now)" \
+        '{state: "error", message: $message, detail: $detail, checkedAt: $at, packages: [], count: 0}'
+      cat "$STATE"
+      return 1
+    fi
+    # Packages from earlier sets that are no longer pending.
+    find "$PKG" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null || true
+  fi
+
+  # Arch news newer than the last one the user acknowledged.
+  local news seen
+  news=$(latest_news)
+  seen=$(cat "$NEWS_SEEN" 2>/dev/null || echo 0)
+
+  local state=ready
+  [[ -n $waiting ]] && state=waiting
+  printf '%s\n' "$pending" | python3 -c '
+import json, re, sys
+pending, plan, restart_re, state, waiting, downloaded, news, seen, now, valid = sys.argv[1:11]
+restart = re.compile(restart_re)
+
+packages = []
+for line in pending.splitlines():
+    parts = line.split()
+    if len(parts) >= 4 and parts[2] == "->":
+        packages.append({"name": parts[0], "from": parts[1], "to": parts[3]})
+
+size = 0
+names = set(p["name"] for p in packages)
+for line in plan.splitlines():
+    parts = line.split()
+    if len(parts) == 3 and parts[2].isdigit():
+        size += int(parts[2])
+        if parts[0] not in names:
+            packages.append({"name": parts[0], "from": "", "to": parts[1]})
+
+reasons = sorted(p["name"] for p in packages if restart.match(p["name"]))
+omarchy = next((p for p in packages if p["name"] in ("omarchy", "omarchy-dev")), None)
+tier = "small"
+if reasons:
+    tier = "restart"
+if omarchy and omarchy["from"]:
+    mm = lambda v: ".".join(re.split(r"[.-]", v)[:2])
+    if mm(omarchy["from"]) != mm(omarchy["to"]):
+        tier = "major"
+
+out = {
+    "state": state,
+    "message": waiting or {"small": "Updates are ready", "restart": "Updates are ready. Restart to finish",
+                           "major": "A new version of Omarchy is ready"}[tier],
+    "tier": tier,
+    "restartReasons": reasons,
+    "omarchy": omarchy,
+    "packages": sorted(packages, key=lambda p: (not restart.match(p["name"]), p["name"])),
+    "count": len(packages),
+    "downloadBytes": size,
+    "downloaded": downloaded == "true",
+    "checkedAt": int(now),
+    "validUntil": int(now) + int(valid),
+}
+if news:
+    when, title, link = news.split("\t")
+    if int(when) > int(seen or 0):
+        out["news"] = {"at": int(when), "title": title, "link": link}
+print(json.dumps(out))
+' "$pending" "$plan" "$RESTART_PATTERN" "$state" "$waiting" "$downloaded" "$news" "$seen" "$(now)" "$VALID_SECONDS" >"$STATE.new"
+  mv -f "$STATE.new" "$STATE"
+  cat "$STATE"
+}
+
+status() {
+  [[ -f $STATE ]] && cat "$STATE" || echo '{"state":"unknown","packages":[],"count":0}'
+}
+
+ack_news() {
+  local news
+  news=$(latest_news)
+  [[ -n $news ]] || return 0
+  mkdir -p "$BASE"
+  cut -f1 <<<"$news" >"$NEWS_SEEN"
+  [[ -f $STATE ]] && jq 'del(.news)' "$STATE" >"$STATE.new" && mv -f "$STATE.new" "$STATE"
+  status
+}
+
+update_now() {
+  local launcher=omarchy-launch-floating-terminal-with-presentation
+  command -v "$launcher" >/dev/null || launcher="${OMARCHY_PATH:-/usr/share/omarchy}/bin/$launcher"
+  setsid -f "$launcher" omarchy-update >/dev/null 2>&1 </dev/null
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  run) run "${1:-}" ;;
+  status) status ;;
+  ack-news) ack_news ;;
+  update-now) update_now ;;
+  -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
+  *) die "unknown command: $cmd (see --help)" ;;
+esac

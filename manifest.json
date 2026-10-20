@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ai-dico.auto-update",
+  "name": "Auto Update",
+  "version": "0.1.0",
+  "author": "Dico",
+  "license": "MIT",
+  "description": "Checks for updates in the background, downloads and verifies them without a password, and tells you in plain words what is ready and whether it needs a restart. Shows Arch news you should read first.",
+  "kinds": ["bar-widget", "overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "overlay": "UpdateOverlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Auto Update",
+    "description": "Background update checks with a plain-language summary",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
