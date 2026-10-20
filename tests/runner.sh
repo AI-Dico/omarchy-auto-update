@@ -56,5 +56,6 @@ FAKE_HELPER_DIR="$T/h"; mkdir -p "$FAKE_HELPER_DIR"
 FG=$(OMARCHY_AUTO_UPDATE_TEST=1 XDG_CACHE_HOME="$T/cache" XDG_RUNTIME_DIR="$T/run" "$RUNNER" deadbeef </dev/null)
 grep -q '"type": "changed"' <<<"$FG" && ok "stops when the set is not the agreed one" || no "stops when the set is not the agreed one"
 
+source "$HERE/helper.sh"
 echo "passed $pass, failed $fail"
 ((fail == 0))

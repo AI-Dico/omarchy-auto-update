@@ -10,6 +10,15 @@
 #                                       session and list what is left to finish
 #   omarchy-auto-update ack-applied     dismiss the result of an update installed on restart
 #   omarchy-auto-update last-applied    the last update installed on restart, for the overlay
+#   omarchy-auto-update config get      print the settings as JSON
+#   omarchy-auto-update config set icon-mode <shown|important|hidden>
+#                                       when the bar icon shows: always when there is
+#                                       something to say, only when it needs you, never
+#   omarchy-auto-update notify          tell the user about news the bar icon can't show
+#                                       right now (once per set or state)
+#   omarchy-auto-update menu-install [--auto]
+#                                       add "Auto Update" under Update in the Omarchy menu
+#   omarchy-auto-update menu-remove     take it out again
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
@@ -33,6 +42,16 @@ SPOOL="${OMARCHY_AUTO_UPDATE_SPOOL:-/var/lib/omarchy-auto-update}" # written by 
 TRIGGER="${OMARCHY_AUTO_UPDATE_TRIGGER:-/system-update}"
 APPLIED_SEEN="$BASE/applied-seen"
 HEALTH="$BASE/health.json"
+NOTIFIED="$BASE/notified"
+MENU_MARK="$BASE/menu-installed"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-auto-update"
+CONFIG="$CONFIG_DIR/config.json"
+PLUGIN_ID="io.github.ai-dico.auto-update"
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+SUMMON="omarchy-shell shell summon $PLUGIN_ID {}"
+MENU_EXT="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_BEGIN="  // >>> omarchy-auto-update (managed by $PLUGIN_ID, edit outside this block)"
+MENU_END="  // <<< omarchy-auto-update"
 
 # A set that touches any of these is installed on restart, never under a
 # running session: kernel and boot chain, core libraries, graphics, the shell
@@ -282,8 +301,33 @@ status() {
     fi
   fi
   [[ -f $RUN_EVENTS ]] && s=$(jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s")
-  offline_state "$s"
+  s=$(offline_state "$s")
+  # The bar icon setting rides along, so the bar picks it up on its usual reload,
+  # and so does the key `notify` uses to tell each set or state only once.
+  jq -c --arg mode "$(icon_mode)" "$NOTIFY_KEYS_JQ"' as $keys | . + {iconMode: $mode, notifyKeys: $keys, notifyKey: ($keys | join("|"))}' <<<"$s" 2>/dev/null ||
+    echo "$s"
 }
+
+# What a notification would be about, one key per thing to tell: a set waiting
+# for a restart, a state that needs the user (with its message and set), a new
+# set downloaded and ready, and Arch news to read first. Nothing while an update
+# runs, since the user started it and the overlay follows it. Keys are one line.
+NOTIFY_KEYS_JQ='
+  def clean: tostring | gsub("[\\r\\n\\t]"; " ");
+  if .run then []
+  else
+    [ (if .restartPending then "restart:" + (.restartPending.fingerprint // "" | clean) else empty end),
+      (if .state == "attention" then "attention:" + ([.reason, .message, .fingerprint] | map(. // "" | clean) | join("/")) else empty end),
+      (if .state == "ready" and (.restartPending | not) then "ready:" + (.fingerprint // "" | clean) else empty end),
+      (if .news then "news:" + (.news.at // "" | clean) + "/" + (.news.link // "" | clean) else empty end) ]
+  end'
+
+# Whether the bar icon shows this status in a given mode. Keep in step with
+# BarWidget.qml (showIcon / importantIcon).
+SHOWS_JQ='
+  if $mode == "hidden" then false
+  elif $mode == "important" then (.run or .restartPending or .state == "attention" or .news)
+  else (.run or .restartPending or .state == "ready" or .state == "attention" or .news) end'
 
 # What the offline installer left: a set waiting for a restart, and the result
 # of the last restart that installed one, until the user has seen it.
@@ -386,6 +430,333 @@ update_now() {
   setsid -f "$launcher" omarchy-update >/dev/null 2>&1 </dev/null
 }
 
+# ---------------------------------------------------------------- settings
+
+ICON_MODES="shown important hidden"
+
+valid_icon_mode() {
+  case "${1:-}" in
+    shown | important | hidden) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+icon_mode() {
+  local m
+  m=$(jq -r 'if (.iconMode | type) == "string" then .iconMode else empty end' "$CONFIG" 2>/dev/null || true)
+  valid_icon_mode "$m" && echo "$m" || echo shown
+}
+
+config_get() {
+  jq -cn --arg iconMode "$(icon_mode)" '{iconMode: $iconMode}'
+}
+
+config_set() {
+  local key="${1:-}" value="${2:-}" base='{}' tmp
+  case $key in
+    icon-mode) valid_icon_mode "$value" || die "icon-mode must be one of: $ICON_MODES" ;;
+    *) die "unknown setting: ${key:-none} (known: icon-mode)" ;;
+  esac
+  mkdir -p "$CONFIG_DIR"
+  exec 7>"$CONFIG_DIR/.lock"
+  flock -w 10 7 || die "settings are being changed; try again"
+  # Settings this version doesn't know are kept; a file that isn't an object is replaced.
+  jq -e 'type == "object"' "$CONFIG" >/dev/null 2>&1 && base=$(cat "$CONFIG")
+  tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+  if ! jq --arg v "$value" '.iconMode = $v' <<<"$base" >"$tmp" || ! mv -f "$tmp" "$CONFIG"; then
+    rm -f "$tmp"
+    die "couldn't write $CONFIG"
+  fi
+  config_get
+}
+
+config() {
+  case "${1:-}" in
+    get) config_get ;;
+    set) shift; config_set "$@" ;;
+    *) die "usage: config get | config set icon-mode <${ICON_MODES// /|}>" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- notifications
+
+# Keys already told (or already shown by the icon), newest last. A short history
+# rather than one key, so ready:A → attention → ready:A doesn't tell A twice.
+NOTIFIED_KEEP=20
+# Notifications handed to notify-wait but not confirmed yet, one file per
+# request holding "epoch<TAB>keys"; each waiter clears only its own.
+NOTIFY_PENDING="$BASE/notify-pending.d"
+NOTIFY_PENDING_SECONDS=60
+
+seen_key() { [[ -f $NOTIFIED ]] && grep -Fxq -- "$1" "$NOTIFIED"; }
+
+# Appends keys (one per line on stdin) to the history, keeping the last few.
+# Callers hold notify.lock.
+remember_keys() {
+  local tmp
+  mkdir -p "$BASE"
+  tmp=$(mktemp "$BASE/.notified.XXXXXX")
+  { cat "$NOTIFIED" 2>/dev/null; cat; } | awk 'NF && !seen[$0]++' | tail -n "$NOTIFIED_KEEP" >"$tmp" &&
+    mv -f "$tmp" "$NOTIFIED" || rm -f "$tmp"
+}
+
+notify_lock() {
+  mkdir -p "$BASE"
+  exec 8>"$BASE/notify.lock"
+  flock -w 10 8
+}
+
+# Called by the bar whenever status.notifyKey changes. Tells the user once per
+# key, and only when the bar icon doesn't show it in the current mode. Keys are
+# remembered on disk only once the notification was handed to the notification
+# service, so a failed delivery is tried again on the next change or start.
+notify() {
+  notify_lock || return 0
+  local s keys=() k fresh=() pending="" at list f
+  s=$(status)
+  while IFS= read -r k; do [[ -n $k ]] && keys+=("$k"); done < <(jq -r '.notifyKeys // [] | .[]' <<<"$s")
+  ((${#keys[@]})) || return 0
+  mkdir -p "$NOTIFY_PENDING"
+  for f in "$NOTIFY_PENDING"/*; do
+    [[ -f $f ]] || continue
+    IFS=$'\t' read -r at list <"$f" || true
+    [[ $at =~ ^[0-9]+$ ]] || at=0
+    # A waiter that never confirmed (killed with the session) stops blocking.
+    if (($(now) - at < NOTIFY_PENDING_SECONDS)); then pending+=$'\x1f'$list; else rm -f "$f"; fi
+  done
+  for k in "${keys[@]}"; do
+    seen_key "$k" && continue
+    [[ $'\x1f'$pending$'\x1f' == *$'\x1f'"$k"$'\x1f'* ]] && continue
+    fresh+=("$k")
+  done
+  ((${#fresh[@]})) || return 0
+  # Seen in the bar: nothing to send, but don't tell it later either.
+  if [[ $(jq -r --arg mode "$(icon_mode)" "$SHOWS_JQ" <<<"$s") != false ]]; then
+    printf '%s\n' "${fresh[@]}" | remember_keys
+    return 0
+  fi
+  local text title body
+  text='
+    # Every key this notification records must be in its text, news included.
+    (if .news then " Arch news to read first: " + .news.title + "." else "" end) as $news |
+    if .restartPending then ["Updates will install when you restart", "Click to see them, or restart when it suits you." + $news]
+    elif .state == "attention" then ["Updates need your attention", (.message // "Click to see why.") + $news]
+    elif .state == "ready" then
+      [(if .tier == "major" then "A new version of Omarchy is ready"
+        else ((.count | tostring) + (if .count == 1 then " update" else " updates" end) + " ready"
+              + (if .tier == "restart" then " · restart to finish" else "" end)) end),
+       (if .news then "Arch news to read first: " + .news.title + ". Click to review the updates."
+        else "Downloaded and checked in the background. Click to review them." end)]
+    else ["Arch news to read before updating", ((.news.title // "") + ". Click to open Auto Update.")] end'
+  title=$(jq -r "$text | .[0]" <<<"$s")
+  body=$(jq -r "$text | .[1]" <<<"$s")
+  local req
+  list=$(IFS=$'\x1f'; echo "${fresh[*]}")
+  req=$(mktemp "$NOTIFY_PENDING/XXXXXX")
+  printf '%s\t%s\n' "$(now)" "$list" >"$req"
+  # notify-send waits for the click; that part runs on its own, without this
+  # lock (fd 8), so the next notify never waits behind an open notification.
+  setsid -f "$SELF" notify-wait "$req" "$list" "$title" "$body" >/dev/null 2>&1 </dev/null 8>&-
+}
+
+# Internal: sends the notification, remembers its keys once the service took
+# it (notify-send prints the id first), and opens the overlay on a click.
+notify_wait() {
+  local req="${1:-}" list="${2:-}" title="${3:-}" body="${4:-}" line sent=false action=""
+  exec 8>&-
+  while IFS= read -r line; do
+    # notify-send prints id 0 when the service refused or wasn't there.
+    if [[ $sent == false && $line =~ ^[0-9]+$ ]]; then
+      ((10#$line > 0)) && sent=true
+      notify_confirm "$req" "$list" "$sent"
+      [[ $sent == true ]] || break
+    elif [[ -n $line ]]; then
+      action=$line
+    fi
+  done < <(notify-send -p -a "Auto Update" -i system-software-update -A "default=Open" -- "$title" "$body" 2>/dev/null)
+  [[ $sent == true ]] || notify_confirm "$req" "$list" false
+  [[ $action == default ]] && omarchy-shell shell summon "$PLUGIN_ID" "{}" >/dev/null 2>&1
+  return 0
+}
+
+# Clears this request's pending note; on success its keys join the history.
+notify_confirm() {
+  (
+    notify_lock || exit 0
+    [[ $3 == true ]] && tr $'\x1f' '\n' <<<"$2" | remember_keys
+    [[ $1 == "$NOTIFY_PENDING"/* ]] && rm -f "$1"
+  )
+}
+
+# ---------------------------------------------------------------- menu entry
+#
+# Like the other ai-dico plugins, this owns one marked block in the user's menu
+# extension file and never touches the rest. A file whose markers are unbalanced
+# or out of order is left alone.
+
+# Prints none | ok | broken.
+block_state() {
+  awk -v b="$2" -v e="$3" '
+    $0 == b { nb++; if (open) bad = 1; open = 1 }
+    $0 == e { ne++; if (!open) bad = 1; open = 0 }
+    END {
+      if (nb == 0 && ne == 0) print "none"
+      else if (nb == 1 && ne == 1 && !bad && !open) print "ok"
+      else print "broken"
+    }' "$1"
+}
+
+file_hash() { [[ -f $1 ]] && sha256sum <"$1" | cut -d' ' -f1 || echo none; }
+
+# True when $1 parses the way Omarchy's menu reads it (MenuModel.stripJsonc:
+# drop whole-line // comments and trailing commas, then JSON.parse).
+menu_parses() {
+  python3 -I -c '
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+raw = re.sub(r"^\s*//[^\n]*(\n|$)", "", raw, flags=re.M)
+raw = re.sub(r",(\s*[}\]])", r"\1", raw)
+sys.exit(0 if isinstance(json.loads(raw), dict) else 1)
+' "$1" 2>/dev/null
+}
+
+# Writes stdin over $1 via a temp file in the same directory (follows symlinks),
+# but only if the result still parses as a menu and $1 still has hash $2 (the
+# content the new text was made from). Otherwise $1 is left as it is.
+#
+# Other programs don't take our lock, so the swap is an atomic exchange: what
+# comes back is exactly what was there at that moment. If someone wrote after
+# the check, their version goes straight back and we try again another time.
+# Left open: a write landing in the instant between the two exchanges.
+replace_file() {
+  local target tmp
+  target=$(readlink -f "$1")
+  tmp=$(mktemp "$(dirname "$target")/.omarchy-auto-update.XXXXXX") || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  if ! menu_parses "$tmp"; then
+    rm -f "$tmp"
+    echo "omarchy-auto-update: the menu file would not parse after the change; left as it was" >&2
+    return 1
+  fi
+  # Tests: another writer edits the file in between.
+  [[ ${OMARCHY_AUTO_UPDATE_TEST:-} == 1 && -n ${OMARCHY_AUTO_UPDATE_TEST_MENU_RACE:-} ]] &&
+    printf '%s\n' "$OMARCHY_AUTO_UPDATE_TEST_MENU_RACE" >>"$target"
+  if [[ $(file_hash "$target") != "$2" ]]; then
+    rm -f "$tmp"
+    echo "omarchy-auto-update: $1 changed while it was being updated; will try again later" >&2
+    return 1
+  fi
+  chmod --reference="$target" "$tmp" 2>/dev/null || true
+  # Tests: another writer edits the file after the check.
+  [[ ${OMARCHY_AUTO_UPDATE_TEST:-} == 1 && -n ${OMARCHY_AUTO_UPDATE_TEST_MENU_RACE_LATE:-} ]] &&
+    printf '%s\n' "$OMARCHY_AUTO_UPDATE_TEST_MENU_RACE_LATE" >>"$target"
+  local ours
+  ours=$(file_hash "$tmp")
+  if ! mv --exchange -- "$tmp" "$target" 2>/dev/null; then
+    # No atomic exchange here (old coreutils or filesystem). A plain rename
+    # could drop someone else's edit, so leave the menu alone.
+    rm -f "$tmp"
+    echo "omarchy-auto-update: can't swap $1 safely here; left it as it was" >&2
+    return 1
+  fi
+  if [[ $(file_hash "$tmp") != "$2" ]]; then
+    # $tmp now holds the other writer's version. Put it back; if that fails,
+    # keep it where it is so nothing they wrote is lost.
+    if mv --exchange -- "$tmp" "$target" 2>/dev/null; then
+      # What comes out should be our text; anything else is a newer edit.
+      if [[ $(file_hash "$tmp") == "$ours" ]]; then
+        rm -f "$tmp"
+      else
+        echo "omarchy-auto-update: $1 was edited again meanwhile; that version is in $tmp" >&2
+      fi
+      echo "omarchy-auto-update: $1 changed while it was being updated; will try again later" >&2
+    else
+      echo "omarchy-auto-update: $1 changed while it was being updated and could not be put back; the other version is in $tmp" >&2
+    fi
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+# Prints $1 without the managed block.
+without_block() {
+  awk -v b="$2" -v e="$3" '$0 == b {skip=1} !skip {print} $0 == e {skip=0}' "$1"
+}
+
+# Prints just the managed block of $1.
+only_block() {
+  awk -v b="$2" -v e="$3" '$0 == b {keep=1} keep {print} $0 == e {keep=0}' "$1"
+}
+
+check_block() {
+  local state
+  state=$(block_state "$1" "$2" "$3")
+  if [[ $state == broken ]]; then
+    echo "omarchy-auto-update: $1 has a damaged omarchy-auto-update block; fix or remove it by hand" >&2
+    return 1
+  fi
+}
+
+# Update › Auto Update opens the overlay. The row hides itself once this helper
+# is gone, so removing the plugin never leaves a dead entry behind.
+menu_block() {
+  local entry
+  entry=$(jq -cn --arg action "$SUMMON" --arg when "test -x $(printf %q "$SELF")" \
+    '{icon: "󱓞", label: "Auto Update", description: "Updates prepared in the background", when: $when, action: $action}')
+  printf '%s\n  "update.auto-update": %s,\n%s\n' "$MENU_BEGIN" "$entry" "$MENU_END"
+}
+
+# The block goes right after the opening brace of the top-level object. Its
+# entry ends in a comma, which the menu's JSONC parser accepts, so the file stays
+# valid whatever follows. Nothing is written when the block is already current.
+write_menu_block() {
+  mkdir -p "$(dirname "$MENU_EXT")"
+  [[ -f $MENU_EXT ]] || printf '{\n}\n' >"$MENU_EXT"
+  check_block "$MENU_EXT" "$MENU_BEGIN" "$MENU_END" || return 1
+  [[ $(only_block "$MENU_EXT" "$MENU_BEGIN" "$MENU_END") == "$(menu_block)" ]] && return 0
+  local stripped hash
+  hash=$(file_hash "$MENU_EXT")
+  stripped=$(without_block "$MENU_EXT" "$MENU_BEGIN" "$MENU_END"; echo x)
+  stripped=${stripped%x}
+  if ! awk '/^[[:space:]]*$/ || /^[[:space:]]*\/\// { next } { exit !/^[[:space:]]*\{[[:space:]]*$/ }' <<<"$stripped"; then
+    echo "omarchy-auto-update: $MENU_EXT does not start with a line holding just '{'; menu entry not added" >&2
+    return 1
+  fi
+  # The block goes in through the environment: `awk -v` would unescape the
+  # backslashes of its JSON.
+  OMU_BLOCK="$(menu_block)" awk '
+    !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print ENVIRON["OMU_BLOCK"]; done = 1; next }
+    { print }' <<<"${stripped%$'\n'}" | replace_file "$MENU_EXT" "$hash"
+}
+
+# `--auto` is what the bar runs at every start: it adds the entry the first
+# time and keeps it current after updates, but once the user has taken it out
+# (by hand or with menu-remove) it stays out until menu-install is run again.
+menu_install() {
+  local auto="${1:-}"
+  mkdir -p "$BASE"
+  exec 7>"$BASE/menu.lock"
+  flock -w 10 7 || die "the menu entry is being changed; try again"
+  if [[ $auto == --auto && -f $MENU_MARK ]] &&
+    { [[ ! -f $MENU_EXT ]] || [[ $(block_state "$MENU_EXT" "$MENU_BEGIN" "$MENU_END") == none ]]; }; then
+    return 0
+  fi
+  write_menu_block || return 1
+  date -Is >"$MENU_MARK"
+}
+
+menu_remove() {
+  mkdir -p "$BASE"
+  exec 7>"$BASE/menu.lock"
+  flock -w 10 7 || die "the menu entry is being changed; try again"
+  [[ -f $MENU_EXT ]] || return 0
+  [[ $(block_state "$MENU_EXT" "$MENU_BEGIN" "$MENU_END") == none ]] && return 0
+  check_block "$MENU_EXT" "$MENU_BEGIN" "$MENU_END" || return 1
+  local hash
+  hash=$(file_hash "$MENU_EXT")
+  without_block "$MENU_EXT" "$MENU_BEGIN" "$MENU_END" | replace_file "$MENU_EXT" "$hash"
+}
+
 cmd="${1:-}"
 shift || true
 case "$cmd" in
@@ -398,6 +769,11 @@ case "$cmd" in
   last-applied) last_applied ;;
   baseline) baseline ;;
   update-now) update_now ;;
+  config) config "$@" ;;
+  notify) notify ;;
+  notify-wait) notify_wait "$@" ;; # internal, started detached by notify
+  menu-install) menu_install "${1:-}" ;;
+  menu-remove) menu_remove ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown command: $cmd (see --help)" ;;
 esac

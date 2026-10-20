@@ -18,6 +18,9 @@ Status: early. One-click undo and quiet installs are next. Design notes in `docs
 omarchy plugin add https://github.com/AI-Dico/omarchy-auto-update --enable
 ```
 
+## Bar icon
+The rocket sits next to Omarchy's own update icon and shows only when there is something to say; warnings and Arch news use a warning sign instead. In the update window, **Bar icon** picks *Shown* (default), *Only when important* (hides a set that is simply downloaded and ready, but still shows restarts, warnings, news and a running update) or *Hidden*. While the icon is hidden you get one notification for each new set, warning or Arch news item, and *Update › Auto Update* in the Omarchy menu always opens the window. The choice is kept in `~/.config/omarchy-auto-update/config.json` (`omarchy-auto-update config set icon-mode shown|important|hidden`). The menu entry lives in a marked block of `~/.config/omarchy/extensions/omarchy-menu.jsonc`; `omarchy-auto-update menu-remove` takes it out and it stays out.
+
 ## How it decides
 
 Arch doesn't support partial upgrades, so Auto Update always fetches and judges the whole pending set. A set that touches the kernel, boot chain, core libraries, graphics, Qt, Quickshell, Hyprland or Omarchy is marked "finishes with a restart"; otherwise it is a small update.

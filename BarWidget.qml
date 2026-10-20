@@ -8,6 +8,10 @@ import qs.Ui
 // Bar icon for Auto Update. It runs the background check on a timer and only
 // shows itself when there is something to say: updates ready, or something
 // that needs the user. A click opens the overlay with the details.
+//
+// The "Bar icon" setting (status.iconMode) can hide the icon for plain "ready"
+// sets or always. Hiding only turns `visible` off: this widget keeps running the
+// checks, and asks the helper to notify about what the icon can't show.
 BarWidget {
   id: root
   moduleName: "io.github.ai-dico.auto-update"
@@ -20,6 +24,15 @@ BarWidget {
   readonly property bool running: !!(status && status.run)
   readonly property bool restartPending: !!(status && status.restartPending)
   readonly property bool showIcon: running || restartPending || status.state === "ready" || status.state === "attention" || hasNews
+  // What still shows in "Only when important": everything but a set that is just ready.
+  readonly property bool importantIcon: running || restartPending || status.state === "attention" || hasNews
+  readonly property string iconMode: (status && status.iconMode) || "shown"
+  readonly property bool iconVisible: iconMode === "hidden" ? false : iconMode === "important" ? importantIcon : showIcon
+  // Warnings keep the warning glyph; everything else about updates is the rocket.
+  readonly property bool warning: !running && !restartPending && (status.state === "attention" || hasNews)
+  // Keep in step with SHOWS_JQ in bin/omarchy-auto-update.
+  readonly property string notifyKey: (status && status.notifyKey) || ""
+  property string notifiedKey: ""
 
   function refresh() {
     if (!checkProc.running) checkProc.running = true
@@ -29,17 +42,22 @@ BarWidget {
     if (!statusProc.running) statusProc.running = true
   }
 
+  // The helper decides from its saved keys whether this is new and whether the
+  // icon already shows it, so a reload or a shell restart never repeats it.
+  // While the icon is hidden it is asked again on every reload: a notification
+  // that couldn't be delivered is not remembered there, and goes out next time.
+  function maybeNotify() {
+    if (root.notifyKey === "") return
+    if (root.notifyKey === root.notifiedKey && root.iconVisible) return
+    root.notifiedKey = root.notifyKey
+    Quickshell.execDetached([root.helper, "notify"])
+  }
   function openDetails() {
     Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.pluginId, "{}"])
   }
 
-  function glyph() {
-    if (running) return "\udb81\udc50"                                   // updating
-    if (restartPending) return "󰜉"                             // restart
-    if (status.state === "attention" || hasNews) return "󰀦"   // alert circle
-    if (status.tier === "restart" || status.tier === "major") return "󰜉" // restart
-    return "󰇚"                                                 // download
-  }
+  // Only warnings use a font glyph now; every other state draws RocketIcon.
+  readonly property string warningGlyph: "󰀦"   // alert circle
 
   function tooltip() {
     if (running) return "Updating… click to see progress"
@@ -53,7 +71,7 @@ BarWidget {
     return what + " ready"
   }
 
-  visible: showIcon
+  visible: iconVisible
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -80,14 +98,28 @@ BarWidget {
     command: [root.helper, "status"]
     stdout: StdioCollector {
       onStreamFinished: {
-        try { root.status = JSON.parse(text) } catch (e) { }
+        try { root.status = JSON.parse(text) } catch (e) { return }
+        root.maybeNotify()
       }
     }
   }
 
+  // Adds Update › Auto Update to the Omarchy menu, the way in when the icon is
+  // hidden. Runs at every start so plugin installs and updates both get it; the
+  // helper writes nothing when the entry is current or the user took it out.
+  Process {
+    id: menuProc
+    command: [root.helper, "menu-install", "--auto"]
+    stderr: StdioCollector {
+      onStreamFinished: if (text.trim()) console.warn("omarchy-auto-update menu-install:", text.trim())
+    }
+  }
   // Show what the last run found right away, then check a few minutes after
   // login (so it never competes with startup) and every six hours after that.
-  Component.onCompleted: root.reload()
+  Component.onCompleted: {
+    root.reload()
+    menuProc.running = true
+  }
 
   Timer {
     interval: 180000
@@ -114,10 +146,15 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.glyph()
+    text: root.warning ? root.warningGlyph : ""
+    iconComponent: root.warning ? null : rocket
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
     tooltipText: root.tooltip()
     onPressed: root.openDetails()
+  }
+  Component {
+    id: rocket
+    RocketIcon { color: button.foreground }
   }
 }

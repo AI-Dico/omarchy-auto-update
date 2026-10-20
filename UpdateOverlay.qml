@@ -286,6 +286,16 @@ Item {
     }
   }
 
+  // "Bar icon" setting. The helper saves it; the bar picks it up on reload.
+  readonly property string iconMode: status.iconMode || "shown"
+
+  function setIconMode(mode) {
+    if (mode === root.iconMode || configProc.running) return
+    root.status = Object.assign({}, root.status, { iconMode: mode })
+    configProc.command = [root.helper, "config", "set", "icon-mode", mode]
+    configProc.running = true
+  }
+
   function readNews() {
     var link = root.status.news ? String(root.status.news.link || "") : ""
     if (link.indexOf("https://archlinux.org/news/") !== 0) return
@@ -376,6 +386,16 @@ Item {
       onStreamFinished: { try { root.status = JSON.parse(text) } catch (e) { } root.reload() }
     }
     onExited: Quickshell.execDetached(["omarchy-shell", "io.github.ai-dico.auto-update.bar", "reload"])
+  }
+
+  Process {
+    id: configProc
+    // Read back what was saved (a failed write shows the old choice again),
+    // then tell the bar so the icon follows right away.
+    onExited: {
+      root.reload()
+      Quickshell.execDetached(["omarchy-shell", "io.github.ai-dico.auto-update.bar", "reload"])
+    }
   }
 
   Process {
@@ -680,6 +700,54 @@ Item {
                 elide: Text.ElideLeft
               }
             }
+          }
+        }
+
+        // Settings
+        Column {
+          width: parent.width
+          spacing: Style.spacing.sm
+          Item {
+            width: parent.width
+            height: iconModeGroup.implicitHeight
+            Text {
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "Bar icon"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            ButtonGroup {
+              id: iconModeGroup
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              options: [
+                { value: "shown", label: "Shown", tooltip: "Show the icon whenever there is something to say" },
+                { value: "important", label: "Only when important", tooltip: "Hide it while updates just wait to be installed" },
+                { value: "hidden", label: "Hidden", tooltip: "Never show the icon" }
+              ]
+              value: root.iconMode
+              foreground: root.foreground
+              background: root.background
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onChanged: function(v) { root.setIconMode(v) }
+            }
+          }
+          Text {
+            visible: root.iconMode !== "shown"
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "When the icon is hidden, a notification tells you about new updates. "
+              + "You can always open Auto Update from the Omarchy menu under Update."
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
           }
         }
 

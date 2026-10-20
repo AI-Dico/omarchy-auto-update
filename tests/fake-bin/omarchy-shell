@@ -1,0 +1,3 @@
+#!/bin/bash
+# Fake omarchy-shell for tests: logs the IPC call instead of reaching the shell.
+printf '%s\n' "$*" >>"${FAKE_SHELL_LOG:-/dev/null}"
