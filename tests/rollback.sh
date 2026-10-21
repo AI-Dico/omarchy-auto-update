@@ -256,5 +256,46 @@ chmod 500 "$T/state/omarchy-auto-update"
 [[ ! -e $T/answers ]] && ok "before restoring" || no "before restoring"
 chmod 700 "$T/state/omarchy-auto-update"
 
+# A keep cut off (the power went): its records written, never renamed.
+cut_keep() {
+  setup
+  make_lss
+  jq '.packages = [{"name":"a","from":"1","to":"2"}]' "$T/spool/result.json" >"$T/r" && mv "$T/r" "$T/spool/result.json"
+  "$H" try-restore
+  echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+  "$H" snapshot-state >/dev/null
+  jq -c '{at: 1, from: .at, packages}' "$T/state/omarchy-auto-update/rollback.json" >"$T/state/omarchy-auto-update/held.json.next"
+  jq -c '.phase = "kept" | .keptAt = 2' "$T/state/omarchy-auto-update/rollback.json" >"$T/state/omarchy-auto-update/rollback.json.next"
+  echo "rootflags=subvol=/@" >"$T/cmdline"
+  jq '.fromBoot = "earlier"' "$T/state/omarchy-auto-update/rollback.json" >"$T/r" && mv "$T/r" "$T/state/omarchy-auto-update/rollback.json"
+  printf '#!/bin/sh\necho "a %s"\n' "$1" >"$T/pacman" && chmod +x "$T/pacman"
+  export OMARCHY_AUTO_UPDATE_PACMAN="$T/pacman"
+}
+
+echo "23. keeping was cut off before it changed anything"
+cut_keep 2
+st=$("$H" snapshot-state)
+[[ $(jq -r '.interrupted, (.kept | type)' <<<"$st" | tr '\n' ' ') == "updated null " ]] && ok "says the updates are still there" || no "says the updates are still there ($st)"
+[[ -z $(ls "$T/state/omarchy-auto-update/") ]] && ok "leaves nothing behind" || no "leaves nothing behind ($(ls "$T/state/omarchy-auto-update/"))"
+[[ ! -e $T/home/.config/autostart/limine-restore-notify.desktop ]] && ok "Omarchy's note is back" || no "Omarchy's note is back"
+
+echo "24. cut off after the restore itself was done"
+cut_keep 1
+st=$("$H" snapshot-state)
+[[ $(jq -r '.interrupted, (.kept | type)' <<<"$st" | tr '\n' ' ') == "null object " ]] && ok "it was kept after all" || no "it was kept after all ($st)"
+[[ -e $T/state/omarchy-auto-update/held.json ]] && ok "the update is held" || no "the update is held"
+
+echo "25. cut off, and the versions don't tell"
+cut_keep 9
+[[ $("$H" snapshot-state | jq -r .interrupted) == unknown ]] && ok "says it can't tell" || no "says it can't tell"
+unset OMARCHY_AUTO_UPDATE_PACMAN
+
+echo "26. cut off after the restore, with a new package in the update"
+cut_keep 1
+jq -c '.packages += [{"name":"b","from":"","to":"5"}]' "$T/state/omarchy-auto-update/rollback.json.next" >"$T/r" && mv "$T/r" "$T/state/omarchy-auto-update/rollback.json.next"
+printf '#!/bin/sh\n[ "$3" = a ] && echo "a 1"\nexit 0\n' >"$T/pacman"
+[[ $("$H" snapshot-state | jq -r '.kept | type') == object ]] && ok "still kept" || no "still kept"
+unset OMARCHY_AUTO_UPDATE_PACMAN
+
 echo "passed $pass, failed $fail"
 ((fail == 0))

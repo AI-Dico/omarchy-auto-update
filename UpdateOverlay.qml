@@ -2,6 +2,8 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
+// Before qs.Ui, whose Button stays the one used here.
+import QtQuick.Controls
 import qs.Commons
 // Qt 6.12 has its own Color type; the shell palette must be qualified.
 import qs.Commons as Commons
@@ -590,6 +592,12 @@ Item {
           Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "20000",
             "Kept the version from before the update",
             "The update is on hold until a newer one comes. The updated version stays in the boot menu under Snapshots."])
+        } else if (st.interrupted) {
+          Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "20000",
+            "Keeping the earlier version didn't finish",
+            st.interrupted === "updated"
+              ? "Your computer started with the updates, as before. To go back, open Auto Update and choose Go back again."
+              : "Your computer may not be on the version you chose. Check it, and if needed go back from the boot menu: choose Snapshots."])
         } else if (st.missed) {
           Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "15000",
             "Couldn't open the restore point",
@@ -606,7 +614,11 @@ Item {
     }
   }
   // What can be tried is read whenever a view that offers it opens.
-  onViewChanged: if ((root.view === "installed" || root.view === "applied") && !rollbackProc.running) rollbackProc.running = true
+  onViewChanged: {
+    if ((root.view === "installed" || root.view === "applied") && !rollbackProc.running) rollbackProc.running = true
+    // Keys (Escape, scrolling) go back to the card once the password field is gone.
+    if (root.view !== "password" && root.opened) Qt.callLater(function() { keys.forceActiveFocus() })
+  }
   Process {
     id: tryProc
     command: [root.helper, "try-restore"]
@@ -675,7 +687,14 @@ Item {
         anchors.fill: parent
         focus: true
         Keys.onPressed: function(event) {
-          if (event.key === Qt.Key_Escape) {
+          if (scroller.interactive && (event.key === Qt.Key_PageDown || event.key === Qt.Key_Down
+              || event.key === Qt.Key_PageUp || event.key === Qt.Key_Up)) {
+            var page = event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp
+            var down = event.key === Qt.Key_PageDown || event.key === Qt.Key_Down
+            scroller.scrollBy((down ? 1 : -1) * (page ? scroller.height * 0.8 : Style.space(40)))
+            event.accepted = true
+          }
+          else if (event.key === Qt.Key_Escape) {
             if (root.view === "password") root.cancelUpdate()
             else root.dismiss()
             event.accepted = true
@@ -687,218 +706,221 @@ Item {
         }
       }
 
-      Column {
-        id: content
-        visible: root.view === "details"
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
+      // On a small screen the card stops at the screen's height and scrolls.
+      Flickable {
+        id: scroller
+        anchors.fill: parent
         anchors.topMargin: card.contentTopInset
-        anchors.leftMargin: card.contentLeftInset
-        anchors.rightMargin: card.contentRightInset
-        spacing: Style.spacing.xxl
+        anchors.bottomMargin: card.contentBottomInset
+        contentWidth: width
+        contentHeight: root.view === "details" ? content.implicitHeight : runView.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+        // Each view starts at its top.
+        readonly property string shownView: root.view
+        onShownViewChanged: contentY = 0
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        function scrollBy(dy) { contentY = Math.max(0, Math.min(contentHeight - height, contentY + dy)) }
 
-        // Header
-        Row {
-          width: parent.width
-          spacing: Style.spacing.xl
-          Text {
-            id: icon
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.status.state === "uptodate" ? "󰄴"
-                : (root.status.state === "attention" || root.status.state === "error") ? "󰀦"
-                : root.busy ? "󰑐" : root.restartPending ? "󰜉" : "󰇚"
-            color: (root.status.state === "attention" || root.status.state === "error") ? root.urgent : root.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.displayLarge
-            RotationAnimation on rotation {
-              running: root.busy && root.opened
-              from: 0; to: 360; duration: 1200; loops: Animation.Infinite
-              onRunningChanged: if (!running) icon.rotation = 0
-            }
-          }
-          Column {
-            width: parent.width - icon.width - Style.spacing.xl
-            spacing: Style.spacing.xs
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.title()
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.heading
-              font.bold: true
-              wrapMode: Text.Wrap
-            }
-            Text {
-              width: parent.width
-              visible: text !== ""
-              textFormat: Text.PlainText
-              text: root.subtitle()
-              color: root.foreground
-              opacity: 0.65
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.Wrap
-            }
-          }
-        }
-
-        // Why it needs a restart (or not)
-        Rectangle {
-          visible: root.ready
-          width: parent.width
-          height: tierLabel.implicitHeight + Style.spacing.xl * 2
-          radius: root.cornerRadius
-          color: root.subtle
-          Text {
-            id: tierLabel
-            anchors.fill: parent
-            anchors.margins: Style.spacing.xl
-            textFormat: Text.PlainText
-            text: root.tierText()
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            wrapMode: Text.Wrap
-            verticalAlignment: Text.AlignVCenter
-          }
-        }
-
-        // Arch news to read first
-        Rectangle {
-          visible: !!root.status.news
-          width: parent.width
-          height: newsCol.implicitHeight + Style.spacing.xl * 2
-          radius: root.cornerRadius
-          color: "transparent"
-          border.width: Math.max(1, Style.space(1))
-          border.color: root.urgent
-          Column {
-            id: newsCol
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: Style.spacing.xl
-            spacing: Style.spacing.md
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: "Arch news to read before updating"
-              color: root.urgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-            }
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.status.news ? root.status.news.title : ""
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.Wrap
-            }
-            Row {
-              spacing: Style.spacing.md
-              Button { text: "Read"; bordered: true; onClicked: root.readNews() }
-              Button { text: "I've read it"; onClicked: root.ackNews() }
-            }
-          }
-        }
-
-        // Package list, collapsed by default
         Column {
-          visible: root.ready && (root.status.packages || []).length > 0
-          width: parent.width
-          spacing: Style.spacing.sm
-          Button {
-            text: (root.showPackages ? "Hide" : "Show") + " what's included"
-            iconText: root.showPackages ? "󰅀" : "󰅂"
-            onClicked: root.showPackages = !root.showPackages
-          }
-          ListView {
-            visible: root.showPackages
+          id: content
+          visible: root.view === "details"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.leftMargin: card.contentLeftInset
+          anchors.rightMargin: card.contentRightInset
+          spacing: Style.spacing.xxl
+
+          // Header
+          Row {
             width: parent.width
-            height: Math.min(contentHeight, Style.space(220))
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.status.packages || []
-            delegate: Item {
-              required property var modelData
-              width: ListView.view.width
-              height: Style.space(24)
-              readonly property bool core: (root.status.restartReasons || []).indexOf(modelData.name) >= 0
+            spacing: Style.spacing.xl
+            Text {
+              id: icon
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.status.state === "uptodate" ? "󰄴"
+                  : (root.status.state === "attention" || root.status.state === "error") ? "󰀦"
+                  : root.busy ? "󰑐" : root.restartPending ? "󰜉" : "󰇚"
+              color: (root.status.state === "attention" || root.status.state === "error") ? root.urgent : root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.displayLarge
+              RotationAnimation on rotation {
+                running: root.busy && root.opened
+                from: 0; to: 360; duration: 1200; loops: Animation.Infinite
+                onRunningChanged: if (!running) icon.rotation = 0
+              }
+            }
+            Column {
+              width: parent.width - icon.width - Style.spacing.xl
+              spacing: Style.spacing.xs
               Text {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width * 0.5
+                width: parent.width
                 textFormat: Text.PlainText
-                text: (core ? "● " : "  ") + modelData.name
-                color: core ? root.accent : root.foreground
+                text: root.title()
+                color: root.foreground
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideRight
+                font.pixelSize: Style.font.heading
+                font.bold: true
+                wrapMode: Text.Wrap
               }
               Text {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width * 0.5
-                horizontalAlignment: Text.AlignRight
+                width: parent.width
+                visible: text !== ""
                 textFormat: Text.PlainText
-                text: (modelData.from ? modelData.from + " → " : "new ") + modelData.to
+                text: root.subtitle()
                 color: root.foreground
-                opacity: 0.6
+                opacity: 0.65
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideLeft
+                font.pixelSize: Style.font.body
+                wrapMode: Text.Wrap
               }
             }
           }
-        }
 
-        // Settings
-        Column {
-          width: parent.width
-          spacing: Style.spacing.sm
-          // Four choices don't fit beside the label, so they sit under it.
+          // Why it needs a restart (or not)
+          Rectangle {
+            visible: root.ready
+            width: parent.width
+            height: tierLabel.implicitHeight + Style.spacing.xl * 2
+            radius: root.cornerRadius
+            color: root.subtle
+            Text {
+              id: tierLabel
+              anchors.fill: parent
+              anchors.margins: Style.spacing.xl
+              textFormat: Text.PlainText
+              text: root.tierText()
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+              verticalAlignment: Text.AlignVCenter
+            }
+          }
+
+          // Arch news to read first
+          Rectangle {
+            visible: !!root.status.news
+            width: parent.width
+            height: newsCol.implicitHeight + Style.spacing.xl * 2
+            radius: root.cornerRadius
+            color: "transparent"
+            border.width: Math.max(1, Style.space(1))
+            border.color: root.urgent
+            Column {
+              id: newsCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.spacing.xl
+              spacing: Style.spacing.md
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "Arch news to read before updating"
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.status.news ? root.status.news.title : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.Wrap
+              }
+              Row {
+                spacing: Style.spacing.md
+                Button { text: "Read"; bordered: true; onClicked: root.readNews() }
+                Button { text: "I've read it"; onClicked: root.ackNews() }
+              }
+            }
+          }
+
+          // Package list, collapsed by default
           Column {
-            id: iconModeBox
+            visible: root.ready && (root.status.packages || []).length > 0
             width: parent.width
             spacing: Style.spacing.sm
-            Text {
-              textFormat: Text.PlainText
-              text: "Bar icon"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
+            Button {
+              text: (root.showPackages ? "Hide" : "Show") + " what's included"
+              iconText: root.showPackages ? "󰅀" : "󰅂"
+              onClicked: root.showPackages = !root.showPackages
             }
-            // One row when the four fit the card; otherwise two rows of two, so a
-            // narrow screen or a large font never pushes them past the edge.
-            readonly property var iconModes: [
-              { value: "always", label: "Always", tooltip: "Keep the icon on the bar, even when Omarchy is up to date" },
-              { value: "updates", label: "With updates", tooltip: "Show the icon whenever there is something to say" },
-              { value: "important", label: "Important only", tooltip: "Hide it while updates just wait to be installed" },
-              { value: "hidden", label: "Hidden", tooltip: "Never show the icon" }
-            ]
-            readonly property bool oneRow: iconModeGroup.implicitWidth <= width
-            ButtonGroup {
-              id: iconModeGroup
-              visible: iconModeBox.oneRow
-              options: iconModeBox.iconModes
-              value: root.iconMode
-              foreground: root.foreground
-              background: root.background
-              accent: root.accent
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onChanged: function(v) { root.setIconMode(v) }
-            }
-            Repeater {
-              model: iconModeBox.oneRow ? [] : [iconModeBox.iconModes.slice(0, 2), iconModeBox.iconModes.slice(2)]
-              ButtonGroup {
+            ListView {
+              visible: root.showPackages
+              width: parent.width
+              height: Math.min(contentHeight, Style.space(220))
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              model: root.status.packages || []
+              delegate: Item {
                 required property var modelData
-                options: modelData
+                width: ListView.view.width
+                height: Style.space(24)
+                readonly property bool core: (root.status.restartReasons || []).indexOf(modelData.name) >= 0
+                Text {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width * 0.5
+                  textFormat: Text.PlainText
+                  text: (core ? "● " : "  ") + modelData.name
+                  color: core ? root.accent : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+                Text {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width * 0.5
+                  horizontalAlignment: Text.AlignRight
+                  textFormat: Text.PlainText
+                  text: (modelData.from ? modelData.from + " → " : "new ") + modelData.to
+                  color: root.foreground
+                  opacity: 0.6
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideLeft
+                }
+              }
+            }
+          }
+
+          // Settings
+          Column {
+            width: parent.width
+            spacing: Style.spacing.sm
+            // Four choices don't fit beside the label, so they sit under it.
+            Column {
+              id: iconModeBox
+              width: parent.width
+              spacing: Style.spacing.sm
+              Text {
+                textFormat: Text.PlainText
+                text: "Bar icon"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              // One row when the four fit the card; otherwise two rows of two, so a
+              // narrow screen or a large font never pushes them past the edge.
+              readonly property var iconModes: [
+                { value: "always", label: "Always", tooltip: "Keep the icon on the bar, even when Omarchy is up to date" },
+                { value: "updates", label: "With updates", tooltip: "Show the icon whenever there is something to say" },
+                { value: "important", label: "Important only", tooltip: "Hide it while updates just wait to be installed" },
+                { value: "hidden", label: "Hidden", tooltip: "Never show the icon" }
+              ]
+              readonly property bool oneRow: iconModeGroup.implicitWidth <= width
+              ButtonGroup {
+                id: iconModeGroup
+                visible: iconModeBox.oneRow
+                options: iconModeBox.iconModes
                 value: root.iconMode
                 foreground: root.foreground
                 background: root.background
@@ -907,464 +929,479 @@ Item {
                 fontSize: Style.font.bodySmall
                 onChanged: function(v) { root.setIconMode(v) }
               }
+              Repeater {
+                model: iconModeBox.oneRow ? [] : [iconModeBox.iconModes.slice(0, 2), iconModeBox.iconModes.slice(2)]
+                ButtonGroup {
+                  required property var modelData
+                  options: modelData
+                  value: root.iconMode
+                  foreground: root.foreground
+                  background: root.background
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onChanged: function(v) { root.setIconMode(v) }
+                }
+              }
+            }
+            Text {
+              visible: root.iconMode === "important" || root.iconMode === "hidden"
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "When the icon is hidden, a notification tells you about new updates. "
+                + "You can always open Auto Update from the Omarchy menu under Update."
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap
             }
           }
-          Text {
-            visible: root.iconMode === "important" || root.iconMode === "hidden"
+
+          // The last update installed on restart, while its restore point is
+          // there to go back to: the way to the installed view after the note.
+          Item {
+            visible: !!root.rollback && root.rollback.available
             width: parent.width
-            textFormat: Text.PlainText
-            text: "When the icon is hidden, a notification tells you about new updates. "
-              + "You can always open Auto Update from the Omarchy menu under Update."
-            color: root.foreground
-            opacity: 0.6
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.Wrap
+            height: lastShow.implicitHeight
+            Text {
+              anchors.left: parent.left
+              anchors.right: lastShow.left
+              anchors.rightMargin: Style.spacing.md
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: {
+                var n = (root.rollback && root.rollback.count) || 0
+                return "Last update: " + (n === 1 ? "1 package" : n + " packages") + " on " + root.rollbackDate()
+              }
+              color: root.foreground
+              opacity: 0.75
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+            Button {
+              id: lastShow
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Show"
+              onClicked: { root.installedWanted = true; if (!installedProc.running) installedProc.running = true }
+            }
+          }
+
+          // Actions
+          Item {
+            width: parent.width
+            height: actions.implicitHeight
+            Text {
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              // Only where it fits beside the buttons (a narrow screen has no room).
+              visible: implicitWidth + Style.spacing.md <= parent.width - actions.width
+              textFormat: Text.PlainText
+              text: root.status.checkedAt ? "Checked " + root.ago(root.status.checkedAt) : ""
+              color: root.foreground
+              opacity: 0.5
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Row {
+              id: actions
+              anchors.right: parent.right
+              spacing: Style.spacing.md
+              Button {
+                text: "Check now"
+                enabled: !root.busy
+                onClicked: root.checkNow()
+              }
+              Button {
+                visible: root.status.state === "held"
+                text: "Install again"
+                iconText: "󰇚"
+                enabled: !againProc.running
+                onClicked: root.installAgain()
+              }
+              Button {
+                visible: (root.ready && !root.restartTier) || (root.status.state === "attention" && !root.restartPending)
+                text: "Update now"
+                iconText: "󰇚"
+                bordered: true
+                selected: true
+                onClicked: root.updateNow()
+              }
+              Button {
+                visible: root.ready && root.restartTier
+                text: "Restart to update"
+                iconText: "󰜉"
+                bordered: true
+                selected: true
+                onClicked: root.restartToUpdate()
+              }
+              Button {
+                visible: root.restartPending
+                text: "Restart now"
+                iconText: "󰜉"
+                bordered: true
+                selected: true
+                onClicked: Quickshell.execDetached(["systemctl", "reboot"])
+              }
+              Button {
+                text: "Close"
+                onClicked: root.dismiss()
+              }
+            }
           }
         }
+        // Password, progress and result of a running update.
+        Column {
+          id: runView
+          visible: root.view !== "details"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.leftMargin: card.contentLeftInset
+          anchors.rightMargin: card.contentRightInset
+          spacing: Style.spacing.xxl
 
-        // The last update installed on restart, while its restore point is
-        // there to go back to: the way to the installed view after the note.
-        Item {
-          visible: !!root.rollback && root.rollback.available
-          width: parent.width
-          height: lastShow.implicitHeight
+          Row {
+            width: parent.width
+            spacing: Style.spacing.xl
+            Text {
+              id: runIcon
+              anchors.verticalCenter: parent.verticalCenter
+              text: (root.view === "rollback-confirm" || root.view === "trying" || root.view === "keep-confirm" || root.view === "keeping") ? "󰜉"
+                  : root.view === "installed" ? "\udb80\udd34"
+                  : (root.view === "password" && !root.passwordSent) ? "\udb80\udf3e"
+                  : root.view === "password" ? "\udb81\udc50"
+                  : root.view === "running" ? "\udb81\udc50"
+                  : (root.result && root.result.ok) ? "\udb80\udd34" : "\udb80\udc26"
+              color: (root.view === "done" && root.result && !root.result.ok) ? root.urgent : root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.displayLarge
+              RotationAnimation on rotation {
+                running: (root.view === "running" || root.view === "keeping" || (root.view === "password" && root.passwordSent)) && root.opened
+                from: 0; to: 360; duration: 1200; loops: Animation.Infinite
+                onRunningChanged: if (!running) runIcon.rotation = 0
+              }
+            }
+            Column {
+              width: parent.width - runIcon.width - Style.spacing.xl
+              spacing: Style.spacing.xs
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.view === "applied" ? root.appliedTitle()
+                    : root.view === "installed" ? root.installedTitle()
+                    : root.view === "rollback-confirm" ? "Go back to before this update?"
+                    : root.view === "trying" ? "You're trying the version from before the update"
+                    : root.view === "keep-confirm" ? "Keep the version from " + root.rollbackDate() + "?"
+                    : root.view === "keeping" ? "Keeping this version…"
+                    : (root.view === "password" && root.passwordSent) ? (root.runKind === "stage" ? "Getting ready for the restart…" : "Checking your password…")
+                    : root.view === "password" ? (root.runKind === "stage" ? "Enter your password to install updates when you restart"
+                        : root.runKind === "finish" ? "One more step to finish the update"
+                        : "Enter your password to install updates")
+                    : root.view === "running" ? (root.phaseLabel || "Starting…")
+                    : (root.result && root.result.ok && root.result.staged) ? "Ready to install when you restart"
+                    : (root.result && root.result.ok && root.result.finished) ? "Update complete"
+                    : (root.result && root.result.ok) ? (root.result.restart ? "Updated. Restart to finish" : "Update complete")
+                    : "The update didn't finish"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                font.bold: true
+                wrapMode: Text.Wrap
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.view === "applied" ? root.appliedText()
+                    : root.view === "installed" ? root.installedText()
+                    : root.view === "rollback-confirm" ? (root.rollbackError || root.confirmText())
+                    : root.view === "trying" ? (root.rollbackError || root.tryingText())
+                    : root.view === "keep-confirm" ? (root.rollbackError || root.keepText())
+                    : root.view === "keeping" ? "Please don't turn off your computer. It restarts when this is done."
+                    : (root.view === "password" && root.passwordSent) ? "This takes a few seconds."
+                    : root.view === "password" ? (root.passwordQueued ? "Checking the updates once more…"
+                        : root.passwordRetry ? "That password didn't work. Try again."
+                        : root.runKind === "finish" ? "Omarchy needs to update some settings. This is the password you use to log in."
+                        : "This is the password you use to log in.")
+                    : root.view === "running" ? "You can keep working. Please don't turn off your computer."
+                    : (root.result && root.result.ok && root.result.staged) ? "Your computer saves a restore point, installs the updates and starts again. You can restart now or later."
+                    : (root.result && root.result.ok) ? (root.result.restart ? "Some parts of the system were updated. They take effect after a restart." : "Everything is up to date.")
+                    : ((root.result && root.result.error) || "")
+                      + ((root.result && root.result.snapshot) ? " A restore point was saved before the update." : "")
+                color: (root.view === "password" && root.passwordRetry) ? root.urgent : root.foreground
+                opacity: (root.view === "password" && root.passwordRetry) ? 1 : 0.65
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.Wrap
+              }
+            }
+          }
+
+          TextField {
+            id: passwordField
+            visible: root.view === "password" && !root.passwordSent
+            width: parent.width
+            password: true
+            placeholderText: "Password"
+            // Open from the start: the runner re-checks the set first, and
+            // what is typed meanwhile is sent once it asks.
+            enabled: !root.passwordQueued && !root.passwordSent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            onAccepted: root.submitPassword()
+            Keys.onEscapePressed: root.cancelUpdate()
+          }
+
+          // What the last update installed on restart changed, and how to go back
           Text {
-            anchors.left: parent.left
-            anchors.right: lastShow.left
-            anchors.rightMargin: Style.spacing.md
-            anchors.verticalCenter: parent.verticalCenter
+            // Results from before this list was recorded have none.
+            visible: root.view === "installed" && text !== ""
+            width: parent.width
             textFormat: Text.PlainText
+            // The first dozen; the card does not scroll.
             text: {
-              var n = (root.rollback && root.rollback.count) || 0
-              return "Last update: " + (n === 1 ? "1 package" : n + " packages") + " on " + root.rollbackDate()
+              var pkgs = (root.installed && root.installed.packages) || []
+              var lines = pkgs.slice(0, 12).map(function(p) {
+                return p.name + "  " + (p.from ? p.from + " → " : "") + p.to
+              })
+              if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
+              return lines.join("\n")
             }
             color: root.foreground
             opacity: 0.75
-            font.family: root.fontFamily
+            font.family: "monospace"
             font.pixelSize: Style.font.bodySmall
-            elide: Text.ElideRight
+            wrapMode: Text.Wrap
           }
-          Button {
-            id: lastShow
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Show"
-            onClicked: { root.installedWanted = true; if (!installedProc.running) installedProc.running = true }
-          }
-        }
-
-        // Actions
-        Item {
-          width: parent.width
-          height: actions.implicitHeight
           Text {
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
+            visible: root.view === "installed"
+            width: parent.width
             textFormat: Text.PlainText
-            text: root.status.checkedAt ? "Checked " + root.ago(root.status.checkedAt) : ""
+            text: root.installedRestore()
             color: root.foreground
-            opacity: 0.5
+            opacity: 0.65
             font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: Style.font.body
+            wrapMode: Text.Wrap
           }
+
+          // What the restore point being tried doesn't have
+          Text {
+            visible: root.view === "trying" && text !== ""
+            width: parent.width
+            textFormat: Text.PlainText
+            text: {
+              var pkgs = (root.trying && root.trying.packages) || []
+              if (pkgs.length === 0) return ""
+              var lines = pkgs.slice(0, 12).map(function(p) {
+                return p.name + "  " + (p.from ? p.from + " here, " : "not here, ") + p.to + " after the update"
+              })
+              if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
+              return "Not in this version:\n" + lines.join("\n")
+            }
+            color: root.foreground
+            opacity: 0.75
+            font.family: "monospace"
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+
+          // What didn't come up after the restart
+          Text {
+            visible: root.view === "applied" && text !== ""
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.after ? (root.after.failed || []).concat((root.status.applied && root.status.applied.warnings) || []).join("\n") : ""
+            color: root.urgent
+            font.family: "monospace"
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+
+          // Progress through the package step
+          Column {
+            visible: root.view === "running" && root.stepTotal > 0
+            width: parent.width
+            spacing: Style.spacing.sm
+            Rectangle {
+              width: parent.width
+              height: Style.space(6)
+              radius: height / 2
+              color: root.subtle
+              Rectangle {
+                width: parent.width * Math.min(1, root.stepDone / Math.max(1, root.stepTotal))
+                height: parent.height
+                radius: parent.radius
+                color: root.accent
+                Behavior on width { NumberAnimation { duration: 250 } }
+              }
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.stepLabel + "  ·  " + root.stepDone + " of " + root.stepTotal
+              color: root.foreground
+              opacity: 0.65
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+          }
+
+          // Raw output, only on request
+          Column {
+            visible: root.view === "running" || root.view === "done"
+            width: parent.width
+            spacing: Style.spacing.sm
+            Button {
+              text: (root.showLog ? "Hide" : "Show") + " details"
+              iconText: root.showLog ? "\udb80\udd40" : "\udb80\udd42"
+              onClicked: root.showLog = !root.showLog
+            }
+            Rectangle {
+              visible: root.showLog
+              width: parent.width
+              height: Style.space(200)
+              radius: root.cornerRadius
+              color: root.subtle
+              ListView {
+                id: logView
+                anchors.fill: parent
+                anchors.margins: Style.spacing.md
+                clip: true
+                model: root.logLines
+                onCountChanged: positionViewAtEnd()
+                delegate: Text {
+                  required property var modelData
+                  width: ListView.view.width
+                  textFormat: Text.PlainText
+                  text: modelData
+                  color: root.foreground
+                  opacity: 0.75
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+
           Row {
-            id: actions
             anchors.right: parent.right
             spacing: Style.spacing.md
             Button {
-              text: "Check now"
-              enabled: !root.busy
-              onClicked: root.checkNow()
+              visible: root.view === "password" && !root.passwordSent
+              text: "Cancel"
+              onClicked: root.cancelUpdate()
             }
             Button {
-              visible: root.status.state === "held"
-              text: "Install again"
-              iconText: "󰇚"
-              enabled: !againProc.running
-              onClicked: root.installAgain()
-            }
-            Button {
-              visible: (root.ready && !root.restartTier) || (root.status.state === "attention" && !root.restartPending)
-              text: "Update now"
-              iconText: "󰇚"
+              visible: root.view === "password" && !root.passwordSent
+              text: root.runKind === "stage" ? "Continue" : root.runKind === "finish" ? "Finish" : "Install"
               bordered: true
               selected: true
-              onClicked: root.updateNow()
+              enabled: !root.passwordQueued && !root.passwordSent && passwordField.text !== ""
+              onClicked: root.submitPassword()
             }
             Button {
-              visible: root.ready && root.restartTier
-              text: "Restart to update"
+              visible: (root.view === "installed" || root.view === "applied") && !!root.rollback && root.rollback.available
+              text: "Go back…"
+              onClicked: root.confirmRollback()
+            }
+            Button {
+              visible: root.view === "installed"
+              text: "Close"
+              bordered: true
+              selected: true
+              onClicked: { root.view = "details"; root.dismiss() }
+            }
+            Button {
+              visible: root.view === "rollback-confirm"
+              text: "Cancel"
+              onClicked: root.view = root.beforeConfirm
+            }
+            Button {
+              visible: root.view === "rollback-confirm"
+              text: "Restart and go back"
               iconText: "󰜉"
               bordered: true
               selected: true
-              onClicked: root.restartToUpdate()
+              enabled: !tryProc.running
+              onClicked: { root.rollbackError = ""; tryProc.running = true }
             }
             Button {
-              visible: root.restartPending
-              text: "Restart now"
+              visible: root.view === "trying"
+              text: "Keep this version…"
+              onClicked: { root.rollbackError = ""; root.view = "keep-confirm" }
+            }
+            Button {
+              visible: root.view === "keep-confirm" && root.keptNoRestart
+              text: "Restart"
               iconText: "󰜉"
               bordered: true
               selected: true
               onClicked: Quickshell.execDetached(["systemctl", "reboot"])
             }
             Button {
-              text: "Close"
+              visible: root.view === "keep-confirm" && !root.keptNoRestart
+              text: "Cancel"
+              onClicked: { root.rollbackError = ""; root.view = "trying" }
+            }
+            Button {
+              // Once kept, only a restart is left to do.
+              visible: root.view === "keep-confirm" && !root.keptNoRestart
+              text: "Keep and restart"
+              iconText: "󰜉"
+              bordered: true
+              selected: true
+              enabled: !keepProc.running
+              onClicked: { root.rollbackError = ""; root.view = "keeping"; keepProc.running = true }
+            }
+            Button {
+              visible: root.view === "trying"
+              text: "Return to the updated version"
+              iconText: "󰜉"
+              bordered: true
+              selected: true
+              enabled: !returnProc.running && !keepProc.running
+              onClicked: returnProc.running = true
+            }
+            Button {
+              visible: root.view === "running"
+              text: "Hide"
               onClicked: root.dismiss()
             }
-          }
-        }
-      }
-      // Password, progress and result of a running update.
-      Column {
-        id: runView
-        visible: root.view !== "details"
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.topMargin: card.contentTopInset
-        anchors.leftMargin: card.contentLeftInset
-        anchors.rightMargin: card.contentRightInset
-        spacing: Style.spacing.xxl
-
-        Row {
-          width: parent.width
-          spacing: Style.spacing.xl
-          Text {
-            id: runIcon
-            anchors.verticalCenter: parent.verticalCenter
-            text: (root.view === "rollback-confirm" || root.view === "trying" || root.view === "keep-confirm" || root.view === "keeping") ? "󰜉"
-                : root.view === "installed" ? "\udb80\udd34"
-                : (root.view === "password" && !root.passwordSent) ? "\udb80\udf3e"
-                : root.view === "password" ? "\udb81\udc50"
-                : root.view === "running" ? "\udb81\udc50"
-                : (root.result && root.result.ok) ? "\udb80\udd34" : "\udb80\udc26"
-            color: (root.view === "done" && root.result && !root.result.ok) ? root.urgent : root.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.displayLarge
-            RotationAnimation on rotation {
-              running: (root.view === "running" || root.view === "keeping" || (root.view === "password" && root.passwordSent)) && root.opened
-              from: 0; to: 360; duration: 1200; loops: Animation.Infinite
-              onRunningChanged: if (!running) runIcon.rotation = 0
+            Button {
+              visible: root.view === "applied"
+              text: (root.status.applied && root.status.applied.ok) ? "Keep using it" : "OK"
+              onClicked: root.keepUsing()
             }
-          }
-          Column {
-            width: parent.width - runIcon.width - Style.spacing.xl
-            spacing: Style.spacing.xs
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.view === "applied" ? root.appliedTitle()
-                  : root.view === "installed" ? root.installedTitle()
-                  : root.view === "rollback-confirm" ? "Go back to before this update?"
-                  : root.view === "trying" ? "You're trying the version from before the update"
-                  : root.view === "keep-confirm" ? "Keep the version from " + root.rollbackDate() + "?"
-                  : root.view === "keeping" ? "Keeping this version…"
-                  : (root.view === "password" && root.passwordSent) ? (root.runKind === "stage" ? "Getting ready for the restart…" : "Checking your password…")
-                  : root.view === "password" ? (root.runKind === "stage" ? "Enter your password to install updates when you restart"
-                      : root.runKind === "finish" ? "One more step to finish the update"
-                      : "Enter your password to install updates")
-                  : root.view === "running" ? (root.phaseLabel || "Starting…")
-                  : (root.result && root.result.ok && root.result.staged) ? "Ready to install when you restart"
-                  : (root.result && root.result.ok && root.result.finished) ? "Update complete"
-                  : (root.result && root.result.ok) ? (root.result.restart ? "Updated. Restart to finish" : "Update complete")
-                  : "The update didn't finish"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.heading
-              font.bold: true
-              wrapMode: Text.Wrap
+            Button {
+              visible: root.view === "applied" && !!root.status.applied && root.status.applied.ok
+              text: "Restart"
+              bordered: true
+              selected: true
+              onClicked: Quickshell.execDetached(["systemctl", "reboot"])
             }
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.view === "applied" ? root.appliedText()
-                  : root.view === "installed" ? root.installedText()
-                  : root.view === "rollback-confirm" ? (root.rollbackError || root.confirmText())
-                  : root.view === "trying" ? (root.rollbackError || root.tryingText())
-                  : root.view === "keep-confirm" ? (root.rollbackError || root.keepText())
-                  : root.view === "keeping" ? "Please don't turn off your computer. It restarts when this is done."
-                  : (root.view === "password" && root.passwordSent) ? "This takes a few seconds."
-                  : root.view === "password" ? (root.passwordQueued ? "Checking the updates once more…"
-                      : root.passwordRetry ? "That password didn't work. Try again."
-                      : root.runKind === "finish" ? "Omarchy needs to update some settings. This is the password you use to log in."
-                      : "This is the password you use to log in.")
-                  : root.view === "running" ? "You can keep working. Please don't turn off your computer."
-                  : (root.result && root.result.ok && root.result.staged) ? "Your computer saves a restore point, installs the updates and starts again. You can restart now or later."
-                  : (root.result && root.result.ok) ? (root.result.restart ? "Some parts of the system were updated. They take effect after a restart." : "Everything is up to date.")
-                  : ((root.result && root.result.error) || "")
-                    + ((root.result && root.result.snapshot) ? " A restore point was saved before the update." : "")
-              color: (root.view === "password" && root.passwordRetry) ? root.urgent : root.foreground
-              opacity: (root.view === "password" && root.passwordRetry) ? 1 : 0.65
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.Wrap
+            Button {
+              visible: root.view === "done" && root.result && root.result.ok && (root.result.restart || root.result.staged)
+              text: "Later"
+              onClicked: { root.finishRun(); root.dismiss() }
             }
-          }
-        }
-
-        TextField {
-          id: passwordField
-          visible: root.view === "password" && !root.passwordSent
-          width: parent.width
-          password: true
-          placeholderText: "Password"
-          // Open from the start: the runner re-checks the set first, and
-          // what is typed meanwhile is sent once it asks.
-          enabled: !root.passwordQueued && !root.passwordSent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          onAccepted: root.submitPassword()
-          Keys.onEscapePressed: root.cancelUpdate()
-        }
-
-        // What the last update installed on restart changed, and how to go back
-        Text {
-          // Results from before this list was recorded have none.
-          visible: root.view === "installed" && text !== ""
-          width: parent.width
-          textFormat: Text.PlainText
-          // The first dozen; the card does not scroll.
-          text: {
-            var pkgs = (root.installed && root.installed.packages) || []
-            var lines = pkgs.slice(0, 12).map(function(p) {
-              return p.name + "  " + (p.from ? p.from + " → " : "") + p.to
-            })
-            if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
-            return lines.join("\n")
-          }
-          color: root.foreground
-          opacity: 0.75
-          font.family: "monospace"
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.Wrap
-        }
-        Text {
-          visible: root.view === "installed"
-          width: parent.width
-          textFormat: Text.PlainText
-          text: root.installedRestore()
-          color: root.foreground
-          opacity: 0.65
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          wrapMode: Text.Wrap
-        }
-
-        // What the restore point being tried doesn't have
-        Text {
-          visible: root.view === "trying" && text !== ""
-          width: parent.width
-          textFormat: Text.PlainText
-          text: {
-            var pkgs = (root.trying && root.trying.packages) || []
-            if (pkgs.length === 0) return ""
-            var lines = pkgs.slice(0, 12).map(function(p) {
-              return p.name + "  " + (p.from ? p.from + " here, " : "not here, ") + p.to + " after the update"
-            })
-            if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
-            return "Not in this version:\n" + lines.join("\n")
-          }
-          color: root.foreground
-          opacity: 0.75
-          font.family: "monospace"
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.Wrap
-        }
-
-        // What didn't come up after the restart
-        Text {
-          visible: root.view === "applied" && text !== ""
-          width: parent.width
-          textFormat: Text.PlainText
-          text: root.after ? (root.after.failed || []).concat((root.status.applied && root.status.applied.warnings) || []).join("\n") : ""
-          color: root.urgent
-          font.family: "monospace"
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.Wrap
-        }
-
-        // Progress through the package step
-        Column {
-          visible: root.view === "running" && root.stepTotal > 0
-          width: parent.width
-          spacing: Style.spacing.sm
-          Rectangle {
-            width: parent.width
-            height: Style.space(6)
-            radius: height / 2
-            color: root.subtle
-            Rectangle {
-              width: parent.width * Math.min(1, root.stepDone / Math.max(1, root.stepTotal))
-              height: parent.height
-              radius: parent.radius
-              color: root.accent
-              Behavior on width { NumberAnimation { duration: 250 } }
+            Button {
+              visible: root.view === "done" && root.result && root.result.ok && (root.result.restart || root.result.staged)
+              text: "Restart now"
+              bordered: true
+              selected: true
+              onClicked: Quickshell.execDetached(["systemctl", "reboot"])
             }
-          }
-          Text {
-            width: parent.width
-            textFormat: Text.PlainText
-            text: root.stepLabel + "  ·  " + root.stepDone + " of " + root.stepTotal
-            color: root.foreground
-            opacity: 0.65
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            elide: Text.ElideRight
-          }
-        }
-
-        // Raw output, only on request
-        Column {
-          visible: root.view === "running" || root.view === "done"
-          width: parent.width
-          spacing: Style.spacing.sm
-          Button {
-            text: (root.showLog ? "Hide" : "Show") + " details"
-            iconText: root.showLog ? "\udb80\udd40" : "\udb80\udd42"
-            onClicked: root.showLog = !root.showLog
-          }
-          Rectangle {
-            visible: root.showLog
-            width: parent.width
-            height: Style.space(200)
-            radius: root.cornerRadius
-            color: root.subtle
-            ListView {
-              id: logView
-              anchors.fill: parent
-              anchors.margins: Style.spacing.md
-              clip: true
-              model: root.logLines
-              onCountChanged: positionViewAtEnd()
-              delegate: Text {
-                required property var modelData
-                width: ListView.view.width
-                textFormat: Text.PlainText
-                text: modelData
-                color: root.foreground
-                opacity: 0.75
-                font.family: "monospace"
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
+            Button {
+              visible: root.view === "done" && !(root.result && root.result.ok && (root.result.restart || root.result.staged))
+              text: "Done"
+              bordered: true
+              onClicked: { root.finishRun(); root.dismiss() }
             }
-          }
-        }
-
-        Row {
-          anchors.right: parent.right
-          spacing: Style.spacing.md
-          Button {
-            visible: root.view === "password" && !root.passwordSent
-            text: "Cancel"
-            onClicked: root.cancelUpdate()
-          }
-          Button {
-            visible: root.view === "password" && !root.passwordSent
-            text: root.runKind === "stage" ? "Continue" : root.runKind === "finish" ? "Finish" : "Install"
-            bordered: true
-            selected: true
-            enabled: !root.passwordQueued && !root.passwordSent && passwordField.text !== ""
-            onClicked: root.submitPassword()
-          }
-          Button {
-            visible: (root.view === "installed" || root.view === "applied") && !!root.rollback && root.rollback.available
-            text: "Go back…"
-            onClicked: root.confirmRollback()
-          }
-          Button {
-            visible: root.view === "installed"
-            text: "Close"
-            bordered: true
-            selected: true
-            onClicked: { root.view = "details"; root.dismiss() }
-          }
-          Button {
-            visible: root.view === "rollback-confirm"
-            text: "Cancel"
-            onClicked: root.view = root.beforeConfirm
-          }
-          Button {
-            visible: root.view === "rollback-confirm"
-            text: "Restart and go back"
-            iconText: "󰜉"
-            bordered: true
-            selected: true
-            enabled: !tryProc.running
-            onClicked: { root.rollbackError = ""; tryProc.running = true }
-          }
-          Button {
-            visible: root.view === "trying"
-            text: "Keep this version…"
-            onClicked: { root.rollbackError = ""; root.view = "keep-confirm" }
-          }
-          Button {
-            visible: root.view === "keep-confirm" && root.keptNoRestart
-            text: "Restart"
-            iconText: "󰜉"
-            bordered: true
-            selected: true
-            onClicked: Quickshell.execDetached(["systemctl", "reboot"])
-          }
-          Button {
-            visible: root.view === "keep-confirm" && !root.keptNoRestart
-            text: "Cancel"
-            onClicked: { root.rollbackError = ""; root.view = "trying" }
-          }
-          Button {
-            // Once kept, only a restart is left to do.
-            visible: root.view === "keep-confirm" && !root.keptNoRestart
-            text: "Keep and restart"
-            iconText: "󰜉"
-            bordered: true
-            selected: true
-            enabled: !keepProc.running
-            onClicked: { root.rollbackError = ""; root.view = "keeping"; keepProc.running = true }
-          }
-          Button {
-            visible: root.view === "trying"
-            text: "Return to the updated version"
-            iconText: "󰜉"
-            bordered: true
-            selected: true
-            enabled: !returnProc.running && !keepProc.running
-            onClicked: returnProc.running = true
-          }
-          Button {
-            visible: root.view === "running"
-            text: "Hide"
-            onClicked: root.dismiss()
-          }
-          Button {
-            visible: root.view === "applied"
-            text: (root.status.applied && root.status.applied.ok) ? "Keep using it" : "OK"
-            onClicked: root.keepUsing()
-          }
-          Button {
-            visible: root.view === "applied" && !!root.status.applied && root.status.applied.ok
-            text: "Restart"
-            bordered: true
-            selected: true
-            onClicked: Quickshell.execDetached(["systemctl", "reboot"])
-          }
-          Button {
-            visible: root.view === "done" && root.result && root.result.ok && (root.result.restart || root.result.staged)
-            text: "Later"
-            onClicked: { root.finishRun(); root.dismiss() }
-          }
-          Button {
-            visible: root.view === "done" && root.result && root.result.ok && (root.result.restart || root.result.staged)
-            text: "Restart now"
-            bordered: true
-            selected: true
-            onClicked: Quickshell.execDetached(["systemctl", "reboot"])
-          }
-          Button {
-            visible: root.view === "done" && !(root.result && root.result.ok && (root.result.restart || root.result.staged))
-            text: "Done"
-            bordered: true
-            onClicked: { root.finishRun(); root.dismiss() }
           }
         }
       }

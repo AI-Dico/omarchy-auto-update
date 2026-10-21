@@ -79,6 +79,7 @@ LSS="${OMARCHY_AUTO_UPDATE_LSS:-/usr/bin/limine-snapper-sync}"
 RESTORE_LOG="$BASE/restore.log"
 # An update the user went back from: not offered again until a newer set comes.
 HELD="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-auto-update/held.json"
+PACMAN="${OMARCHY_AUTO_UPDATE_PACMAN:-pacman}"
 
 # A set that touches any of these is installed on restart, never under a
 # running session: kernel and boot chain, core libraries, graphics, the shell
@@ -611,7 +612,7 @@ end_try() {
     grep -q "Added by $PLUGIN_ID" "$RESTORE_NOTE" 2>/dev/null; then
     rm -f "$RESTORE_NOTE"
   fi
-  rm -f "$ROLLBACK" "$ROLLBACK.tmp"
+  rm -f "$ROLLBACK" "$ROLLBACK.tmp" "$ROLLBACK.next" "$HELD.next"
 }
 
 # This boot and a try in progress. In a restore point: {inSnapshot: N, ours,
@@ -639,15 +640,48 @@ snapshot_state() {
     return 0
   fi
   [[ -f $ROLLBACK ]] && try=$(jq -c . "$ROLLBACK" 2>/dev/null || echo '{}')
-  local phase missed=false kept=null
+  local phase missed=false kept=null interrupted=null
   phase=$(jq -r '.phase // empty' <<<"$try")
+  # Keeping was started but its records never took effect (the power went, say).
+  # Which system started tells how far it got: the installed versions are
+  # those from before the update (kept after all) or after it (nothing changed).
+  if [[ -f $ROLLBACK.next && $phase != kept ]]; then
+    case $(booted_side) in
+      before)
+        mv -f "$HELD.next" "$HELD" 2>/dev/null || true
+        mv -f "$ROLLBACK.next" "$ROLLBACK" 2>/dev/null && try=$(jq -c . "$ROLLBACK" 2>/dev/null || echo '{}')
+        phase=$(jq -r '.phase // empty' <<<"$try")
+        ;;
+      after) interrupted='"updated"' ;;
+      *) interrupted='"unknown"' ;;
+    esac
+  fi
   if [[ $phase == requested && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
     missed=true
   fi
   # Kept for good: the first normal boot after it says so, once.
   [[ $phase == kept ]] && kept=$(jq -c '{at, count, keptAt}' <<<"$try")
   [[ -n $phase && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]] && end_try
-  jq -cn --argjson missed "$missed" --argjson kept "$kept" '{inSnapshot: null, missed: $missed, kept: $kept}'
+  # Records written for a keep happen only inside a restore point: none belong here.
+  rm -f "$ROLLBACK.next" "$HELD.next"
+  jq -cn --argjson missed "$missed" --argjson kept "$kept" --argjson interrupted "$interrupted" \
+    '{inSnapshot: null, missed: $missed, kept: $kept, interrupted: $interrupted}'
+}
+
+# Which side of the update this system is on, from the packages it changed:
+# "before", "after", or nothing when they don't all agree.
+booted_side() {
+  local pkgs side
+  pkgs=$(jq -c '.packages // []' "$ROLLBACK.next" 2>/dev/null) || return 0
+  # A separator that isn't whitespace, so an empty "from" (a new package) stays a field.
+  side=$(jq -r '.[] | [.name, (.from // ""), (.to // "")] | join("\u001f")' <<<"$pkgs" | while IFS=$'\x1f' read -r name from to; do
+    have=$("$PACMAN" -Q -- "$name" 2>/dev/null | awk '{print $2}')
+    if [[ $have == "$from" ]]; then echo before
+    elif [[ -n $to && $have == "$to" ]]; then echo after
+    else echo other; fi
+  done | sort -u)
+  [[ $side == before || $side == after ]] && echo "$side"
+  return 0
 }
 
 # Keep the restore point being tried: Limine's restore makes it the system
@@ -661,9 +695,11 @@ keep_restore() {
   [[ $(jq -r '.snapshot // empty' <<<"$try") == "$current" ]] || die "this restore point wasn't started by Auto Update"
   mkdir -p "$BASE"
   # The records the restored system needs are written first: if they can't be,
-  # nothing is restored. They take effect by a rename once it is done.
+  # nothing is restored. They are on disk before it (a power cut must not leave
+  # them empty) and take effect by a rename once it is done.
   if ! jq -c '{at: (now | floor), from: .at, packages: (.packages // [])}' <<<"$try" >"$HELD.next" ||
-    ! jq -c --argjson t "$(now)" '.phase = "kept" | .keptAt = $t' <<<"$try" >"$ROLLBACK.next"; then
+    ! jq -c --argjson t "$(now)" '.phase = "kept" | .keptAt = $t' <<<"$try" >"$ROLLBACK.next" ||
+    ! sync -- "$HELD.next" "$ROLLBACK.next"; then
     rm -f "$HELD.next" "$ROLLBACK.next"
     die "couldn't save what to hold back; nothing changed"
   fi
