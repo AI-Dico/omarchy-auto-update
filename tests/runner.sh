@@ -4,6 +4,10 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUNNER="$HERE/../bin/omarchy-auto-update-runner"
 pass=0 fail=0
+# A normal boot, even when these run inside a restore point being tried.
+CMDLINE_FAKE=$(mktemp)
+echo "rootflags=subvol=/@ quiet" >"$CMDLINE_FAKE"
+export OMARCHY_AUTO_UPDATE_CMDLINE="$CMDLINE_FAKE"
 ok() { echo "  ok   $1"; pass=$((pass + 1)); }
 no() { echo "  FAIL $1"; fail=$((fail + 1)); }
 

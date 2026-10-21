@@ -19,6 +19,11 @@
 #   omarchy-auto-update menu-install [--auto]
 #                                       add "Auto Update" under Update in the Omarchy menu
 #   omarchy-auto-update menu-remove     take it out again
+#   omarchy-auto-update rollback-info   whether the last update installed on restart can
+#                                       be tried without, and from which boot entry
+#   omarchy-auto-update try-restore     restart once into the restore point taken before it
+#   omarchy-auto-update snapshot-state  whether this boot is a restore point, and ours
+#   omarchy-auto-update return-updated  from a restore point, restart into the normal system
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
@@ -52,6 +57,18 @@ SUMMON="omarchy-shell shell summon $PLUGIN_ID {}"
 MENU_EXT="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 MENU_BEGIN="  // >>> omarchy-auto-update (managed by $PLUGIN_ID, edit outside this block)"
 MENU_END="  // <<< omarchy-auto-update"
+# Trying a restore point: kept in the home subvolume, which going back never touches.
+ROLLBACK="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-auto-update/rollback.json"
+# Omarchy's own "Restore now" note, which opens a terminal; hidden only for a try we started.
+RESTORE_NOTE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/limine-restore-notify.desktop"
+EFIVARS="${OMARCHY_AUTO_UPDATE_EFIVARS:-/sys/firmware/efi/efivars}"
+CMDLINE="${OMARCHY_AUTO_UPDATE_CMDLINE:-/proc/cmdline}"
+SYSTEMCTL="${OMARCHY_AUTO_UPDATE_SYSTEMCTL:-/usr/bin/systemctl}"
+# Choosing the next boot entry needs root: logind only knows systemd-style
+# entries, not Limine's, so the request goes to the EFI variable through
+# bootctl, with Omarchy's password dialog (polkit).
+PKEXEC="${OMARCHY_AUTO_UPDATE_PKEXEC:-/usr/bin/pkexec}"
+BOOTCTL=/usr/bin/bootctl
 
 # A set that touches any of these is installed on restart, never under a
 # running session: kernel and boot chain, core libraries, graphics, the shell
@@ -135,6 +152,13 @@ run() {
   mkdir -p "$BASE"
   exec 9>"$LOCK"
   flock -n 9 || die "a check is already running"
+
+  # A restore point is read-only and only being tried: no updates from it.
+  # The saved state is left for the normal system.
+  if [[ -n $(booted_snapshot) ]]; then
+    status
+    return 0
+  fi
 
   if [[ $force != --force && -f $STATE ]]; then
     local valid
@@ -292,6 +316,22 @@ RUN_EVENTS="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-auto-update/run.jsonl
 status() {
   local s='{"state":"unknown","packages":[],"count":0}'
   [[ -f $STATE ]] && s=$(cat "$STATE")
+  # The saved state belongs to the normal system; a restore point being tried
+  # offers nothing.
+  local current
+  current=$(booted_snapshot)
+  if [[ -n $current ]]; then
+    mark_reached "$current"
+    # Our try: "attention" keeps the bar icon up in every icon mode, the way to
+    # decide whenever the user is ready to. A restore point started from the
+    # boot menu is Omarchy's own to restore; there is nothing to decide here.
+    if [[ $(jq -r '.snapshot // empty' "$ROLLBACK" 2>/dev/null) == "$current" ]]; then
+      jq -cn '{state: "attention", reason: "trying", message: "Trying the version from before the update. Open to decide", packages: [], count: 0}'
+    else
+      jq -cn '{state: "uptodate", reason: "snapshot", message: "Running from a restore point. Updates wait for the normal system", packages: [], count: 0}'
+    fi
+    return 0
+  fi
   # An update started from the overlay that the user hasn't dismissed yet. If
   # its process is gone without saying it finished, record that it stopped.
   if [[ -f $RUN_EVENTS ]] && ! grep -q '"type": "done"' "$RUN_EVENTS"; then
@@ -402,7 +442,7 @@ ack_applied() {
 # "installed" view shows when the note after it is clicked.
 last_applied() {
   local r
-  r=$(jq -c 'select(.ok == true)' "$SPOOL/result.json" 2>/dev/null) || r=""
+  r=$(jq -c 'select(.ok == true or .state == "partial")' "$SPOOL/result.json" 2>/dev/null) || r=""
   [[ -n $r ]] || { echo '{}'; return 0; }
   # Results written before the installer recorded the packages have none; read
   # them from pacman's log, between the start and the end of that install.
@@ -433,6 +473,199 @@ PY
 )
   fi
   echo "$r"
+}
+
+# The restore point this boot runs from, from the kernel command line.
+booted_snapshot() {
+  grep -oE 'subvol=[^ ]*/\.snapshots/[0-9]+/snapshot' "$CMDLINE" 2>/dev/null | grep -oE '[0-9]+' | tail -n 1 || true
+}
+
+# Limine's boot entries and its current one, from the Boot Loader Interface.
+# Prints JSON: {"entries": [...], "selected": "..."}.
+loader_entries() {
+  python3 -I - "$EFIVARS" <<'PY' 2>/dev/null || echo '{"entries":[],"selected":""}'
+import glob, json, os, sys
+GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+def read(name):
+    try:
+        with open(os.path.join(sys.argv[1], f"{name}-{GUID}"), "rb") as f:
+            data = f.read()[4:]  # attributes first
+    except OSError:
+        return []
+    return [e for e in data.decode("utf-16-le", "replace").split("\0") if e]
+sel = read("LoaderEntrySelected")
+print(json.dumps({"entries": read("LoaderEntries"), "selected": sel[0] if sel else ""}))
+PY
+}
+
+# Whether the last update installed on restart can be tried without, and how.
+rollback_info() {
+  local applied current
+  # Installed or only partly installed: both left a restore point to go back to.
+  applied=$(jq -c 'select(.state == "installed" or .state == "partial")' "$SPOOL/result.json" 2>/dev/null) || applied=""
+  [[ -n $applied ]] || applied='{}'
+  current=$(booted_snapshot)
+  python3 -I - "$applied" "$(loader_entries)" "$current" <<'PY'
+import json, re, sys
+from datetime import datetime
+a, le, current = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
+out = {"available": False, "count": a.get("count", 0), "at": a.get("at", 0)}
+n = (a.get("snapshots") or {}).get("root")
+safe = re.compile(r"^[A-Za-z0-9._-]+$")
+def why(reason):
+    out["reason"] = reason
+    print(json.dumps(out))
+    sys.exit(0)
+if current:
+    why("in-snapshot")
+if not isinstance(n, int) or not a.get("bootMenu"):
+    why("no-restore-point")
+selected = le.get("selected", "")
+# The kernel part of the entry this boot came from ("…linux-omarchy"), so the
+# restore point starts the same kind of kernel.
+kernel = selected.rsplit(".", 1)[-1] if "." in selected else ""
+found = []
+for e in le.get("entries", []):
+    m = re.search(r"(?:^|\.)Snapshots\.(\d+)-+(\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d)\.", e)
+    if not m or int(m.group(1)) != n or not safe.match(e):
+        continue
+    if kernel and not e.endswith("." + kernel):
+        continue
+    # Same snapshot as this update's: taken right after it started.
+    try:
+        taken = datetime.strptime(m.group(2), "%Y-%m-%d-%H-%M-%S").timestamp()
+    except ValueError:
+        continue
+    if abs(taken - a.get("at", 0)) <= 600:
+        found.append(e)
+if len(found) != 1 or not safe.match(selected):
+    why("no-boot-entry")
+out.update(available=True, snapshot=n, entry=found[0], normal=selected)
+print(json.dumps(out))
+PY
+}
+
+# Restart once into the restore point; the normal entry stays the default.
+try_restore() {
+  local info entry
+  [[ -z $(booted_snapshot) ]] || die "already running from a restore point"
+  info=$(rollback_info)
+  [[ $(jq -r .available <<<"$info") == true ]] || die "no restore point to try ($(jq -r '.reason // "unknown"' <<<"$info"))"
+  entry=$(jq -r .entry <<<"$info")
+  mkdir -p "$(dirname "$ROLLBACK")"
+  # A try already armed in this boot (its restart failed): the one-time entry is
+  # still set, so its record must outlive a cancelled second attempt.
+  local boot armed=false
+  boot=$(cat /proc/sys/kernel/random/boot_id)
+  if [[ -f $ROLLBACK ]] && jq -e --arg b "$boot" '.armed == true and .fromBoot == $b' "$ROLLBACK" >/dev/null 2>&1; then
+    armed=true
+  fi
+  # Ours to remove later only if absent now or added by an earlier try.
+  local hid=false
+  if [[ ! -e $RESTORE_NOTE ]] || grep -q "Added by $PLUGIN_ID" "$RESTORE_NOTE" 2>/dev/null; then
+    hid=true
+  fi
+  # The try is written before anything else changes, so a later boot can always
+  # undo it; nothing restarts unless it was saved.
+  # What the restore point lacks, for the view in it.
+  local packages
+  packages=$(last_applied | jq -c '.packages // []' 2>/dev/null) || packages='[]'
+  if ! jq -n --argjson info "$info" --argjson at "$(now)" --arg boot "$boot" --argjson armed "$armed" \
+    --argjson hid "$hid" --argjson packages "$packages" \
+    '$info + {phase: "requested", requestedAt: $at, fromBoot: $boot, hidNote: $hid, armed: $armed, packages: $packages}' >"$ROLLBACK.tmp" ||
+    ! mv -f "$ROLLBACK.tmp" "$ROLLBACK"; then
+    rm -f "$ROLLBACK.tmp"
+    die "couldn't save the try"
+  fi
+  if [[ $hid == true ]] && ! {
+    mkdir -p "$(dirname "$RESTORE_NOTE")" &&
+      printf '[Desktop Entry]\nHidden=true\n# Added by %s for one restore-point try; removed after it.\n' "$PLUGIN_ID" >"$RESTORE_NOTE"
+  }; then
+    end_try
+    die "couldn't prepare the restore point"
+  fi
+  if ! "$PKEXEC" "$BOOTCTL" set-oneshot "$entry"; then
+    [[ $armed == true ]] || end_try
+    die "the restart into the restore point wasn't confirmed"
+  fi
+  jq '.armed = true' "$ROLLBACK" >"$ROLLBACK.tmp" && mv -f "$ROLLBACK.tmp" "$ROLLBACK"
+  # The one-time entry is set now: the try stays recorded even if this restart
+  # fails, so whichever boot comes next knows what it is.
+  "$SYSTEMCTL" reboot || die "couldn't restart; the restore point opens at the next restart"
+}
+
+# Undo what a try changed outside the restore point.
+end_try() {
+  if [[ -f $ROLLBACK && $(jq -r '.hidNote // false' "$ROLLBACK" 2>/dev/null) == true ]] &&
+    grep -q "Added by $PLUGIN_ID" "$RESTORE_NOTE" 2>/dev/null; then
+    rm -f "$RESTORE_NOTE"
+  fi
+  rm -f "$ROLLBACK" "$ROLLBACK.tmp"
+}
+
+# This boot and a try in progress. In a restore point: {inSnapshot: N, ours,
+# ...the try}. Back in the normal system the try ends here; "missed" says the
+# restart didn't reach the restore point.
+# Reached: from here on, the next normal boot is not a missed try. Called from
+# status too, which the shell runs as soon as it starts.
+mark_reached() {
+  local current="$1" try
+  [[ -f $ROLLBACK ]] || return 0
+  try=$(jq -c . "$ROLLBACK" 2>/dev/null) || return 0
+  if [[ $(jq -r '.phase // empty' <<<"$try") == requested && $(jq -r '.snapshot // empty' <<<"$try") == "$current" ]]; then
+    jq -c '.phase = "trying"' <<<"$try" >"$ROLLBACK.tmp" && mv -f "$ROLLBACK.tmp" "$ROLLBACK"
+  fi
+  return 0
+}
+
+snapshot_state() {
+  local current try='{}'
+  current=$(booted_snapshot)
+  if [[ -n $current ]]; then
+    mark_reached "$current"
+    [[ -f $ROLLBACK ]] && try=$(jq -c . "$ROLLBACK" 2>/dev/null || echo '{}')
+    jq -c --argjson n "$current" '. + {inSnapshot: $n, ours: (.snapshot == $n)}' <<<"$try"
+    return 0
+  fi
+  [[ -f $ROLLBACK ]] && try=$(jq -c . "$ROLLBACK" 2>/dev/null || echo '{}')
+  local phase missed=false
+  phase=$(jq -r '.phase // empty' <<<"$try")
+  if [[ $phase == requested && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
+    missed=true
+  fi
+  [[ -n $phase && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]] && end_try
+  jq -cn --argjson missed "$missed" '{inSnapshot: null, missed: $missed}'
+}
+
+# From a restore point back to the normal system. Omarchy's Limine menu starts
+# its default entry, the normal system, so a plain restart is enough. Where it
+# remembers the last entry instead, that restart comes back here: the second
+# time, the normal entry is chosen by name (with the password).
+return_updated() {
+  local normal entries phase boot
+  [[ -n $(booted_snapshot) ]] || die "not running from a restore point"
+  boot=$(cat /proc/sys/kernel/random/boot_id)
+  # Came back here after a return from an earlier boot; a second press in the
+  # same boot (its restart didn't happen) still restarts plainly.
+  phase=$(jq -r --arg b "$boot" 'if .phase == "returning" and .returnFrom != $b then "returned" else "" end' "$ROLLBACK" 2>/dev/null || true)
+  if [[ -f $ROLLBACK ]]; then
+    jq --arg boot "$boot" '.phase = "returning" | .returnFrom = $boot' "$ROLLBACK" >"$ROLLBACK.tmp" &&
+      mv -f "$ROLLBACK.tmp" "$ROLLBACK"
+  fi
+  if [[ $phase != returned ]]; then
+    "$SYSTEMCTL" reboot
+    return
+  fi
+  normal=$(jq -r '.normal // empty' "$ROLLBACK" 2>/dev/null || true)
+  entries=$(loader_entries)
+  # Without a remembered one that still exists, the only entry outside Snapshots.
+  if ! [[ $normal =~ ^[A-Za-z0-9._-]+$ ]] || ! jq -e --arg n "$normal" '.entries | index($n)' <<<"$entries" >/dev/null; then
+    normal=$(jq -r '[.entries[] | select(test("(^|\\.)Snapshots\\.") | not) | select(test("^[A-Za-z0-9._-]+$"))]
+      | if length == 1 then .[0] else empty end' <<<"$entries")
+  fi
+  [[ -n $normal ]] || die "couldn't find the normal boot entry; restart and pick it in the boot menu"
+  "$PKEXEC" "$BOOTCTL" set-oneshot "$normal" || die "the restart wasn't confirmed"
+  "$SYSTEMCTL" reboot
 }
 
 ack_news() {
@@ -808,6 +1041,10 @@ case "$cmd" in
   notify-wait) notify_wait "$@" ;; # internal, started detached by notify
   menu-install) menu_install "${1:-}" ;;
   menu-remove) menu_remove ;;
+  rollback-info) rollback_info ;;
+  try-restore) try_restore ;;
+  snapshot-state) snapshot_state ;;
+  return-updated) return_updated ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown command: $cmd (see --help)" ;;
 esac

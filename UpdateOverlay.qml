@@ -49,6 +49,13 @@ Item {
   property var installed: null
   // Set by the note's Open; any other opening or closing cancels it.
   property bool installedWanted: false
+  // Going back to the restore point taken before that update: whether it can
+  // (rollback-info), the try this boot is part of (snapshot-state), and the
+  // view to return to from the confirmation.
+  property var rollback: null
+  property var trying: null
+  property string beforeConfirm: "installed"
+  property string rollbackError: ""
   readonly property string runner: decodeURIComponent(String(Qt.resolvedUrl("bin/omarchy-auto-update-runner")).replace(/^file:\/\//, ""))
   property bool awaitingPassword: false
   // Typed before the runner finished re-checking the set; sent when it asks.
@@ -69,10 +76,13 @@ Item {
     root.opened = true
     root.showPackages = false
     // A finished run stays on screen until dismissed; an idle overlay starts fresh.
-    if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied") root.view = "details"
+    if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied" && root.view !== "trying") root.view = "details"
     // From the note after an update installed on restart: what it changed.
     var payload = null
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { }
+    // In a restore point we restarted into, opening is how the user decides.
+    if (root.trying && root.view === "details") root.view = "trying"
+    else if (root.view === "details" && !rollbackProc.running) rollbackProc.running = true
     root.installedWanted = !!payload && typeof payload === "object" && payload.view === "installed" && root.view === "details"
     if (root.installedWanted && !installedProc.running) installedProc.running = true
     root.reload()
@@ -434,20 +444,53 @@ Item {
 
   function installedTitle() {
     var n = (root.installed && root.installed.count) || 0
+    if (root.installed && root.installed.state === "partial") return "The update didn't finish"
     return n === 1 ? "1 update installed" : n + " updates installed"
   }
 
   function installedText() {
     var a = root.installed || {}
     var when = a.at ? new Date(a.at * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat) : ""
+    if (a.state === "partial")
+      return (a.message ? a.message + " " : "") + "Started while restarting" + (when ? " on " + when : "") + "."
     return "Installed while restarting" + (when ? " on " + when : "") + "."
   }
 
   function installedRestore() {
     var a = root.installed || {}
     if (!a.bootMenu) return "No restore point was saved for this update."
+    if (root.rollback && root.rollback.available)
+      return "If something seems wrong since then, choose Go back to try how it was before, without changing anything for good."
     return "If something seems wrong since then, you can go back: restart, choose Snapshots in the boot menu "
       + "and pick the latest one. When it has started, choose Restore."
+  }
+
+  function rollbackDate() {
+    var at = (root.rollback && root.rollback.at) || (root.trying && root.trying.at) || 0
+    return at ? new Date(at * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat) : ""
+  }
+
+  function confirmRollback() {
+    root.beforeConfirm = root.view
+    root.rollbackError = ""
+    root.view = "rollback-confirm"
+  }
+
+  function confirmText() {
+    var n = (root.rollback && root.rollback.count) || 0
+    return "Your computer restarts into how it was on " + root.rollbackDate() + ", before "
+      + (n === 1 ? "this update" : "these " + n + " updates") + ". Your files and settings stay as they are. "
+      + "Nothing is changed for good: from there you can come back to the updated version. "
+      + "Choosing the restore point asks for your password once."
+  }
+
+  function tryingText() {
+    if (root.trying && root.trying.phase === "returning")
+      return "Your computer started this restore point again. Choose Back once more: this time it asks for your password to pick the updated version."
+    var n = (root.trying && root.trying.count) || 0
+    return "Nothing has changed for good yet. This is your computer as it was on " + root.rollbackDate() + ", before "
+      + (n === 1 ? "the update" : "the " + n + " updates") + ", and your files and settings are as you left them. "
+      + "Use it as long as you like. Return to the updated version, or undo the update only if this one works better."
   }
 
   function appliedText() {
@@ -471,7 +514,7 @@ Item {
       onStreamFinished: {
         var a = null
         try { a = JSON.parse(text) } catch (e) { }
-        if (!a || !a.ok || !root.installedWanted) return
+        if (!a || !(a.ok || a.state === "partial") || !root.installedWanted) return
         root.installedWanted = false
         root.installed = a
         if (root.view === "details") root.view = "installed"
@@ -496,6 +539,66 @@ Item {
   }
 
   Component.onCompleted: root.reload()
+
+  // A restore point we restarted into: say so, a little after login.
+  Timer {
+    interval: 3000
+    running: true
+    onTriggered: snapshotProc.running = true
+  }
+  Process {
+    id: snapshotProc
+    command: [root.helper, "snapshot-state"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var st = null
+        try { st = JSON.parse(text) } catch (e) { return }
+        if (st.inSnapshot && st.ours) {
+          // No pop-up: deciding takes using it for a while. A note says so;
+          // the bar icon opens the decision whenever the user is ready.
+          root.trying = st
+          if (root.opened) root.view = "trying"
+          else Quickshell.execDetached(["bash", "-c",
+            '[[ $(notify-send -a "Auto Update" -t 20000 -A default=Open -- "$1" "$2") == default ]] && ' +
+            'omarchy-shell shell summon io.github.ai-dico.auto-update "{}"', "notify",
+            "Trying the version from before the update",
+            "Use it as long as you like. When you've decided, click the update icon in the bar to keep it or return to the updated version."])
+        } else if (st.missed) {
+          Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "15000",
+            "Couldn't open the restore point",
+            "Your computer started normally, with the updates. You can still go back from the boot menu: choose Snapshots and pick the latest one."])
+        }
+      }
+    }
+  }
+  Process {
+    id: rollbackProc
+    command: [root.helper, "rollback-info"]
+    stdout: StdioCollector {
+      onStreamFinished: { try { root.rollback = JSON.parse(text) } catch (e) { root.rollback = null } }
+    }
+  }
+  // What can be tried is read whenever a view that offers it opens.
+  onViewChanged: if ((root.view === "installed" || root.view === "applied") && !rollbackProc.running) rollbackProc.running = true
+  Process {
+    id: tryProc
+    command: [root.helper, "try-restore"]
+    stderr: StdioCollector { id: tryErr }
+    onExited: function(code) {
+      // On success the computer is already restarting.
+      if (code !== 0) root.rollbackError = "Couldn't restart into the restore point: "
+        + (tryErr.text.replace(/^omarchy-auto-update: /, "").trim() || "unknown error") + "."
+    }
+  }
+  Process {
+    id: returnProc
+    command: [root.helper, "return-updated"]
+    stderr: StdioCollector { id: returnErr }
+    onExited: function(code) {
+      if (code !== 0) root.rollbackError = returnErr.text.replace(/^omarchy-auto-update: /, "").trim()
+        || "Couldn't restart into the updated version. Restart and pick it in the boot menu."
+    }
+  }
 
   PanelWindow {
     id: panel
@@ -776,6 +879,37 @@ Item {
           }
         }
 
+        // The last update installed on restart, while its restore point is
+        // there to go back to: the way to the installed view after the note.
+        Item {
+          visible: !!root.rollback && root.rollback.available
+          width: parent.width
+          height: lastShow.implicitHeight
+          Text {
+            anchors.left: parent.left
+            anchors.right: lastShow.left
+            anchors.rightMargin: Style.spacing.md
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: {
+              var n = (root.rollback && root.rollback.count) || 0
+              return "Last update: " + (n === 1 ? "1 package" : n + " packages") + " on " + root.rollbackDate()
+            }
+            color: root.foreground
+            opacity: 0.75
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+          Button {
+            id: lastShow
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Show"
+            onClicked: { root.installedWanted = true; if (!installedProc.running) installedProc.running = true }
+          }
+        }
+
         // Actions
         Item {
           width: parent.width
@@ -848,7 +982,8 @@ Item {
           Text {
             id: runIcon
             anchors.verticalCenter: parent.verticalCenter
-            text: root.view === "installed" ? "\udb80\udd34"
+            text: (root.view === "rollback-confirm" || root.view === "trying") ? "󰜉"
+                : root.view === "installed" ? "\udb80\udd34"
                 : (root.view === "password" && !root.passwordSent) ? "\udb80\udf3e"
                 : root.view === "password" ? "\udb81\udc50"
                 : root.view === "running" ? "\udb81\udc50"
@@ -870,6 +1005,8 @@ Item {
               textFormat: Text.PlainText
               text: root.view === "applied" ? root.appliedTitle()
                   : root.view === "installed" ? root.installedTitle()
+                  : root.view === "rollback-confirm" ? "Go back to before this update?"
+                  : root.view === "trying" ? "You're trying the version from before the update"
                   : (root.view === "password" && root.passwordSent) ? (root.runKind === "stage" ? "Getting ready for the restart…" : "Checking your password…")
                   : root.view === "password" ? (root.runKind === "stage" ? "Enter your password to install updates when you restart"
                       : root.runKind === "finish" ? "One more step to finish the update"
@@ -890,6 +1027,8 @@ Item {
               textFormat: Text.PlainText
               text: root.view === "applied" ? root.appliedText()
                   : root.view === "installed" ? root.installedText()
+                  : root.view === "rollback-confirm" ? (root.rollbackError || root.confirmText())
+                  : root.view === "trying" ? (root.rollbackError || root.tryingText())
                   : (root.view === "password" && root.passwordSent) ? "This takes a few seconds."
                   : root.view === "password" ? (root.passwordQueued ? "Checking the updates once more…"
                       : root.passwordRetry ? "That password didn't work. Try again."
@@ -957,6 +1096,27 @@ Item {
           wrapMode: Text.Wrap
         }
 
+        // What the restore point being tried doesn't have
+        Text {
+          visible: root.view === "trying" && text !== ""
+          width: parent.width
+          textFormat: Text.PlainText
+          text: {
+            var pkgs = (root.trying && root.trying.packages) || []
+            if (pkgs.length === 0) return ""
+            var lines = pkgs.slice(0, 12).map(function(p) {
+              return p.name + "  " + (p.from ? p.from + " here, " : "not here, ") + p.to + " after the update"
+            })
+            if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
+            return "Not in this version:\n" + lines.join("\n")
+          }
+          color: root.foreground
+          opacity: 0.75
+          font.family: "monospace"
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
         // What didn't come up after the restart
         Text {
           visible: root.view === "applied" && text !== ""
@@ -1001,7 +1161,7 @@ Item {
 
         // Raw output, only on request
         Column {
-          visible: root.view !== "password" && root.view !== "applied" && root.view !== "installed"
+          visible: root.view === "running" || root.view === "done"
           width: parent.width
           spacing: Style.spacing.sm
           Button {
@@ -1054,11 +1214,45 @@ Item {
             onClicked: root.submitPassword()
           }
           Button {
+            visible: (root.view === "installed" || root.view === "applied") && !!root.rollback && root.rollback.available
+            text: "Go back…"
+            onClicked: root.confirmRollback()
+          }
+          Button {
             visible: root.view === "installed"
             text: "Close"
             bordered: true
             selected: true
             onClicked: { root.view = "details"; root.dismiss() }
+          }
+          Button {
+            visible: root.view === "rollback-confirm"
+            text: "Cancel"
+            onClicked: root.view = root.beforeConfirm
+          }
+          Button {
+            visible: root.view === "rollback-confirm"
+            text: "Restart and go back"
+            iconText: "󰜉"
+            bordered: true
+            selected: true
+            enabled: !tryProc.running
+            onClicked: { root.rollbackError = ""; tryProc.running = true }
+          }
+          Button {
+            visible: root.view === "trying"
+            text: "Undo the update for good…"
+            // Omarchy's own restore: it asks for the password in a terminal.
+            onClicked: Quickshell.execDetached(["limine-snapper-restore"])
+          }
+          Button {
+            visible: root.view === "trying"
+            text: "Return to the updated version"
+            iconText: "󰜉"
+            bordered: true
+            selected: true
+            enabled: !returnProc.running
+            onClicked: returnProc.running = true
           }
           Button {
             visible: root.view === "running"

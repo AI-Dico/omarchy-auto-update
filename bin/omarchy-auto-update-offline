@@ -21,7 +21,7 @@ can never loop. It checks the set again against the system as it is now, saves
 a restore point and puts it in the boot menu, installs the set from the cache,
 and records the result for the first login.
 """
-import hashlib, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time
+import csv, hashlib, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time
 
 # Read once, first: this is what gets installed as root, so it must be the code
 # that is running now, not whatever the file holds a moment later.
@@ -51,6 +51,7 @@ VALID_SECONDS = 3 * 24 * 3600  # same as the background check
 MIN_FREE_BYTES = 10 * 1024 ** 3  # same floor as omarchy update
 OVERWRITE = "/usr/share/omarchy/*"  # as omarchy-update-system-pkgs
 KEYRINGS = ("archlinux-keyring", "omarchy-keyring")
+OUR_SNAPSHOT = "omarchy-auto-update=yes"  # Snapper userdata of our restore points
 SAFE_NAME = re.compile(r"^[A-Za-z0-9@._+-]+$")
 # A version with an epoch puts a colon in the file name (lib32-mesa-1:26.2.5-1-…).
 PKG_NAME = re.compile(r"^[A-Za-z0-9@._+:-]+\.pkg\.tar(\.(zst|xz|gz|bz2|lz4|lrz|lzo|Z))?$")
@@ -457,6 +458,21 @@ def say(log, text):
         pass  # telling the user must never change the outcome
 
 
+def release_older(config, keep):
+    """Our earlier restore points of this config back to the number cleanup."""
+    p = run(["snapper", "--no-dbus", "-c", config, "--csvout", "list", "--columns", "number,cleanup,userdata"],
+            120, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    if p.returncode != 0:
+        return
+    for row in list(csv.reader(p.stdout.splitlines()))[1:]:
+        number, cleanup, userdata = (row + ["", "", ""])[:3]
+        # Userdata is "key=value, key=value"; only our exact pair counts.
+        ours = OUR_SNAPSHOT in (pair.strip() for pair in userdata.split(","))
+        if number.isdigit() and int(number) != keep and cleanup == "" and ours:
+            run(["snapper", "--no-dbus", "-c", config, "modify", "-c", "number", number], 120,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def snapshot(log, label):
     """Restore points of every Snapper config, as ({config: number}, in boot
     menu). Without Snapper there is none, as in omarchy-snapshot; with it, a
@@ -473,12 +489,15 @@ def snapshot(log, label):
     for config in configs:
         if not SAFE_NAME.match(config):
             continue
-        s = run(["snapper", "--no-dbus", "-c", config, "create", "-c", "number", "-p", "-d", label], 600,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Kept out of Snapper's cleanup, so the overlay's "go back" still finds
+        # it after later snapshots; the one before goes back to the cleanup.
+        s = run(["snapper", "--no-dbus", "-c", config, "create", "-c", "", "-u", OUR_SNAPSHOT,
+                 "-p", "-d", label], 600, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if s.returncode != 0 or not s.stdout.strip().isdigit():
             log.write(f"snapshot of {config} failed: {s.stderr.strip()}\n")
             raise Stop(10, "Couldn't save a restore point, so nothing was installed.")
         taken[config] = int(s.stdout.strip())
+        release_older(config, taken[config])
         run(["snapper", "--no-dbus", "-c", config, "cleanup", "number"], 600,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # The watcher that adds snapshots to the boot menu isn't running here.
