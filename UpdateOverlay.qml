@@ -355,7 +355,9 @@ Item {
       if (status.downloadBytes) parts.push(mb(status.downloadBytes))
       return parts.join(" · ")
     }
-    return status.message || ""
+    // The helper often sends the title itself as the message ("Omarchy is up to date").
+    var m = status.message || ""
+    return m === title() ? "" : m
   }
 
   // Plain-language reason for the tier, with the packages that caused it.
