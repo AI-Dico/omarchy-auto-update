@@ -21,7 +21,7 @@ wait_lines() { for _ in $(seq 1 20); do (($(lines "$1") >= $2)) && return; sleep
 
 echo "5. settings"
 helper_env
-[[ $("$HELPER" config get) == '{"iconMode":"shown"}' ]] && ok "icon mode defaults to shown" || no "icon mode defaults to shown"
+[[ $("$HELPER" config get) == '{"iconMode":"updates"}' ]] && ok "icon mode defaults to updates" || no "icon mode defaults to updates"
 "$HELPER" config set icon-mode important >/dev/null
 [[ $(jq -r .iconMode "$CONF") == important ]] && ok "config set writes the file" || no "config set writes the file"
 [[ $("$HELPER" config get) == '{"iconMode":"important"}' ]] && ok "config get reads it back" || no "config get reads it back"
@@ -33,7 +33,7 @@ echo '{"later": 1, "iconMode": "shown"}' >"$CONF"
 [[ $(jq -c . "$CONF") == '{"later":1,"iconMode":"hidden"}' ]] && ok "keeps settings it doesn't know" || no "keeps settings it doesn't know"
 [[ -z $(find "$XDG_CONFIG_HOME/omarchy-auto-update" -name '.config.*') ]] && ok "no temp file left behind" || no "no temp file left behind"
 echo 'not json' >"$CONF"
-[[ $("$HELPER" config get) == '{"iconMode":"shown"}' ]] && ok "a damaged file reads as the default" || no "a damaged file reads as the default"
+[[ $("$HELPER" config get) == '{"iconMode":"updates"}' ]] && ok "a damaged file reads as the default" || no "a damaged file reads as the default"
 "$HELPER" config set icon-mode hidden >/dev/null
 set_state '{"state":"ready","fingerprint":"aaa","count":2,"tier":"small","packages":[]}'
 [[ $("$HELPER" status | jq -r .iconMode) == hidden ]] && ok "status carries the icon mode" || no "status carries the icon mode"
@@ -116,7 +116,11 @@ for v in 'shown important' 'important hidden' ' shown' 'Shown'; do
   "$HELPER" config set icon-mode "$v" 2>/dev/null && no "rejects '$v'" || ok "rejects '$v'"
 done
 mkdir -p "${CONF%/*}"; echo '{"iconMode": "shown important"}' >"$CONF"
-[[ $("$HELPER" config get) == '{"iconMode":"shown"}' ]] && ok "a compound value on disk reads as shown" || no "a compound value on disk reads as shown"
+[[ $("$HELPER" config get) == '{"iconMode":"updates"}' ]] && ok "a compound value on disk reads as the default" || no "a compound value on disk reads as the default"
+echo '{"iconMode": "shown"}' >"$CONF"
+[[ $("$HELPER" config get) == '{"iconMode":"updates"}' ]] && ok "the old shown reads as updates" || no "the old shown reads as updates"
+"$HELPER" config set icon-mode always && [[ $("$HELPER" config get) == '{"iconMode":"always"}' ]] && ok "always is a choice" || no "always is a choice"
+! "$HELPER" config set icon-mode shown 2>/dev/null && ok "shown is no longer accepted" || no "shown is no longer accepted"
 
 helper_env
 P="$T/my plugin/bin"; mkdir -p "$P"; cp "$HELPER" "$P/"
@@ -210,3 +214,16 @@ grep -q 'written after the check' "$MENU" && ! grep -q 'update.auto-update' "$ME
 [[ -z $(find "${MENU%/*}" -name '.omarchy-auto-update.*') ]] && ok "no swap file left behind" || no "no swap file left behind"
 "$HELPER" menu-install && grep -q 'written after the check' "$MENU" && grep -q 'update.auto-update' "$MENU" &&
   ok "the next try adds the entry over it" || no "the next try adds the entry over it"
+
+echo "10. which states the icon shows"
+# SHOWS_JQ is what notify uses to decide whether the bar already says it; it has
+# to agree with showIcon / importantIcon in BarWidget.qml.
+eval "$(sed -n "/^SHOWS_JQ='/,/ end'\$/p" "$HELPER")"
+shows() { jq -nr --arg mode "$1" "$2 | $SHOWS_JQ"; }
+[[ $(shows updates '{state: "error"}') == true ]] && ok "updates shows an error" || no "updates shows an error"
+[[ $(shows important '{state: "error"}') == true ]] && ok "important shows an error" || no "important shows an error"
+[[ $(shows updates '{state: "downloading"}') == false ]] && ok "updates hides a download in progress" || no "updates hides a download in progress"
+[[ $(shows updates '{state: "checking"}') == false ]] && ok "updates hides a check in progress" || no "updates hides a check in progress"
+[[ $(shows important '{state: "ready"}') == false ]] && ok "important hides a plain ready set" || no "important hides a plain ready set"
+[[ $(shows always '{state: "uptodate"}') == true ]] && ok "always shows up to date" || no "always shows up to date"
+[[ $(shows hidden '{state: "error"}') == false ]] && ok "hidden shows nothing" || no "hidden shows nothing"

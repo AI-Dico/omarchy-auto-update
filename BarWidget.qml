@@ -23,13 +23,28 @@ BarWidget {
   readonly property bool hasNews: !!(status && status.news)
   readonly property bool running: !!(status && status.run)
   readonly property bool restartPending: !!(status && status.restartPending)
-  readonly property bool showIcon: running || restartPending || status.state === "ready" || status.state === "attention" || hasNews
+  readonly property bool restartTier: status.tier === "restart" || status.tier === "major"
+  // A check that failed (mirrors unreachable, a download that broke) is as
+  // important as a warning. Checking and downloading need nothing from the user,
+  // so they show only in "Always".
+  readonly property bool showIcon: running || restartPending || status.state === "ready" || status.state === "attention"
+    || status.state === "error" || hasNews
   // What still shows in "Only when important": everything but a set that is just ready.
-  readonly property bool importantIcon: running || restartPending || status.state === "attention" || hasNews
-  readonly property string iconMode: (status && status.iconMode) || "shown"
-  readonly property bool iconVisible: iconMode === "hidden" ? false : iconMode === "important" ? importantIcon : showIcon
-  // Warnings keep the warning glyph; everything else about updates is the rocket.
-  readonly property bool warning: !running && !restartPending && (status.state === "attention" || hasNews)
+  readonly property bool importantIcon: running || restartPending || status.state === "attention"
+    || status.state === "error" || hasNews
+  readonly property string iconMode: (status && status.iconMode) || "updates"
+  readonly property bool iconVisible: iconMode === "hidden" ? false
+    : iconMode === "always" ? true
+    : iconMode === "important" ? importantIcon : showIcon
+  // The one state RocketIcon draws (design C). The icon does all the drawing.
+  readonly property string look: running ? "running"
+    : restartPending ? "restart"
+    : status.state === "error" ? "error"
+    : (status.state === "attention" || hasNews) ? "attention"
+    : status.state === "checking" ? "checking"
+    : status.state === "downloading" ? "downloading"
+    : status.state === "ready" ? (restartTier ? "restart" : "ready")
+    : "uptodate"
   // Keep in step with SHOWS_JQ in bin/omarchy-auto-update.
   readonly property string notifyKey: (status && status.notifyKey) || ""
   property string notifiedKey: ""
@@ -56,20 +71,29 @@ BarWidget {
     Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.pluginId, "{}"])
   }
 
-  // Only warnings use a font glyph now; every other state draws RocketIcon.
-  readonly property string warningGlyph: "󰀦"   // alert circle
-
   function tooltip() {
-    if (running) return "Updating… click to see progress"
-    if (restartPending) return "Updates will install when you restart"
-    if (hasNews && status.state !== "ready") return "Arch news to read before updating"
-    if (status.state === "attention") return status.message || "Updates need your attention"
     var n = status.count || 0
     var what = n === 1 ? "1 update" : n + " updates"
-    if (status.tier === "major") return "A new version of Omarchy is ready"
-    if (status.tier === "restart") return what + " ready · restart to finish"
-    return what + " ready"
+    switch (look) {
+      case "running": return "Updating… click to see progress"
+      case "restart":
+        if (restartPending) return "Updates will install when you restart"
+        if (status.tier === "major") return "A new version of Omarchy is ready"
+        return what + " ready · restart to finish"
+      case "error": return status.message || "Couldn't prepare updates"
+      case "attention":
+        if (status.state === "attention") return status.message || "Updates need your attention"
+        // Arch news beside a ready set keeps the set's own words.
+        if (status.state === "ready") return status.tier === "major" ? "A new version of Omarchy is ready"
+          : restartTier ? what + " ready · restart to finish" : what + " ready"
+        return "Arch news to read before updating"
+      case "checking": return "Checking for updates"
+      case "downloading": return status.message || "Downloading updates"
+      case "ready": return what + " ready"
+    }
+    return status.message || "Omarchy is up to date"
   }
+
 
   visible: iconVisible
   implicitWidth: button.implicitWidth
@@ -146,8 +170,9 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.warning ? root.warningGlyph : ""
-    iconComponent: root.warning ? null : rocket
+    // RocketIcon draws every state, including the warnings; with nothing to
+    // say ("Always" only) it fades itself.
+    iconComponent: rocket
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
     tooltipText: root.tooltip()
@@ -155,6 +180,9 @@ BarWidget {
   }
   Component {
     id: rocket
-    RocketIcon { color: button.foreground }
+    RocketIcon {
+      look: root.look
+      color: button.foreground
+    }
   }
 }

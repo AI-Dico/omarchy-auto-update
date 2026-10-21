@@ -11,7 +11,7 @@
 #   omarchy-auto-update ack-applied     dismiss the result of an update installed on restart
 #   omarchy-auto-update last-applied    the last update installed on restart, for the overlay
 #   omarchy-auto-update config get      print the settings as JSON
-#   omarchy-auto-update config set icon-mode <shown|important|hidden>
+#   omarchy-auto-update config set icon-mode <always|updates|important|hidden>
 #                                       when the bar icon shows: always when there is
 #                                       something to say, only when it needs you, never
 #   omarchy-auto-update notify          tell the user about news the bar icon can't show
@@ -326,8 +326,9 @@ NOTIFY_KEYS_JQ='
 # BarWidget.qml (showIcon / importantIcon).
 SHOWS_JQ='
   if $mode == "hidden" then false
-  elif $mode == "important" then (.run or .restartPending or .state == "attention" or .news)
-  else (.run or .restartPending or .state == "ready" or .state == "attention" or .news) end'
+  elif $mode == "always" then true
+  elif $mode == "important" then (.run or .restartPending or .state == "attention" or .state == "error" or .news)
+  else (.run or .restartPending or .state == "ready" or .state == "attention" or .state == "error" or .news) end'
 
 # What the offline installer left: a set waiting for a restart, and the result
 # of the last restart that installed one, until the user has seen it.
@@ -463,11 +464,11 @@ update_now() {
 
 # ---------------------------------------------------------------- settings
 
-ICON_MODES="shown important hidden"
+ICON_MODES="always updates important hidden"
 
 valid_icon_mode() {
   case "${1:-}" in
-    shown | important | hidden) return 0 ;;
+    always | updates | important | hidden) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -475,7 +476,9 @@ valid_icon_mode() {
 icon_mode() {
   local m
   m=$(jq -r 'if (.iconMode | type) == "string" then .iconMode else empty end' "$CONFIG" 2>/dev/null || true)
-  valid_icon_mode "$m" && echo "$m" || echo shown
+  # "shown" was the name of "updates" before there were four choices.
+  [[ $m == shown ]] && m=updates
+  valid_icon_mode "$m" && echo "$m" || echo updates
 }
 
 config_get() {

@@ -19,7 +19,20 @@ omarchy plugin add https://github.com/AI-Dico/omarchy-auto-update --enable
 ```
 
 ## Bar icon
-The rocket sits next to Omarchy's own update icon and shows only when there is something to say; warnings and Arch news use a warning sign instead. In the update window, **Bar icon** picks *Shown* (default), *Only when important* (hides a set that is simply downloaded and ready, but still shows restarts, warnings, news and a running update) or *Hidden*. While the icon is hidden you get one notification for each new set, warning or Arch news item, and *Update › Auto Update* in the Omarchy menu always opens the window. The choice is kept in `~/.config/omarchy-auto-update/config.json` (`omarchy-auto-update config set icon-mode shown|important|hidden`). The menu entry lives in a marked block of `~/.config/omarchy/extensions/omarchy-menu.jsonc`; `omarchy-auto-update menu-remove` takes it out and it stays out.
+The rocket sits next to Omarchy's own update icon and tells the state with its flame:
+
+| State | Icon |
+|---|---|
+| Up to date (*Always* only) | rocket without a flame, faded |
+| Checking | flickering flame in the bar colour |
+| Downloading | flickering yellow flame |
+| Ready | yellow flame |
+| Needs a restart | yellow flame and a small ↑ badge |
+| Installing | flickering flame and a turning ring |
+| Needs a look, or Arch news to read | yellow warning sign |
+| Something failed | red warning sign |
+
+In the update window, **Bar icon** picks *Always*, *When there are updates* (default), *Only when important* (hides a set that is simply downloaded and ready, but still shows restarts, warnings, errors, news and a running update) or *Hidden*. Checking and downloading show only with *Always*, since they need nothing from you. While the icon is hidden you get one notification for each new set, warning or Arch news item, and *Update › Auto Update* in the Omarchy menu always opens the window. The choice is kept in `~/.config/omarchy-auto-update/config.json` (`omarchy-auto-update config set icon-mode always|updates|important|hidden`). The menu entry lives in a marked block of `~/.config/omarchy/extensions/omarchy-menu.jsonc`; `omarchy-auto-update menu-remove` takes it out and it stays out.
 
 ## How it decides
 

@@ -291,7 +291,7 @@ Item {
   }
 
   // "Bar icon" setting. The helper saves it; the bar picks it up on reload.
-  readonly property string iconMode: status.iconMode || "shown"
+  readonly property string iconMode: status.iconMode === "shown" ? "updates" : (status.iconMode || "updates")
 
   function setIconMode(mode) {
     if (mode === root.iconMode || configProc.running) return
@@ -712,27 +712,31 @@ Item {
         Column {
           width: parent.width
           spacing: Style.spacing.sm
-          Item {
+          // Four choices don't fit beside the label, so they sit under it.
+          Column {
+            id: iconModeBox
             width: parent.width
-            height: iconModeGroup.implicitHeight
+            spacing: Style.spacing.sm
             Text {
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
               text: "Bar icon"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
             }
+            // One row when the four fit the card; otherwise two rows of two, so a
+            // narrow screen or a large font never pushes them past the edge.
+            readonly property var iconModes: [
+              { value: "always", label: "Always", tooltip: "Keep the icon on the bar, even when Omarchy is up to date" },
+              { value: "updates", label: "With updates", tooltip: "Show the icon whenever there is something to say" },
+              { value: "important", label: "Important only", tooltip: "Hide it while updates just wait to be installed" },
+              { value: "hidden", label: "Hidden", tooltip: "Never show the icon" }
+            ]
+            readonly property bool oneRow: iconModeGroup.implicitWidth <= width
             ButtonGroup {
               id: iconModeGroup
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              options: [
-                { value: "shown", label: "Shown", tooltip: "Show the icon whenever there is something to say" },
-                { value: "important", label: "Only when important", tooltip: "Hide it while updates just wait to be installed" },
-                { value: "hidden", label: "Hidden", tooltip: "Never show the icon" }
-              ]
+              visible: iconModeBox.oneRow
+              options: iconModeBox.iconModes
               value: root.iconMode
               foreground: root.foreground
               background: root.background
@@ -741,9 +745,23 @@ Item {
               fontSize: Style.font.bodySmall
               onChanged: function(v) { root.setIconMode(v) }
             }
+            Repeater {
+              model: iconModeBox.oneRow ? [] : [iconModeBox.iconModes.slice(0, 2), iconModeBox.iconModes.slice(2)]
+              ButtonGroup {
+                required property var modelData
+                options: modelData
+                value: root.iconMode
+                foreground: root.foreground
+                background: root.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onChanged: function(v) { root.setIconMode(v) }
+              }
+            }
           }
           Text {
-            visible: root.iconMode !== "shown"
+            visible: root.iconMode === "important" || root.iconMode === "hidden"
             width: parent.width
             textFormat: Text.PlainText
             text: "When the icon is hidden, a notification tells you about new updates. "
