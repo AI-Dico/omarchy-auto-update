@@ -47,6 +47,8 @@ Item {
   property var after: null
   // The last update installed on restart, for the "installed" view.
   property var installed: null
+  // Set by the note's Open; any other opening or closing cancels it.
+  property bool installedWanted: false
   readonly property string runner: decodeURIComponent(String(Qt.resolvedUrl("bin/omarchy-auto-update-runner")).replace(/^file:\/\//, ""))
   property bool awaitingPassword: false
   // Typed before the runner finished re-checking the set; sent when it asks.
@@ -69,17 +71,19 @@ Item {
     // A finished run stays on screen until dismissed; an idle overlay starts fresh.
     if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied") root.view = "details"
     // From the note after an update installed on restart: what it changed.
-    var payload = {}
+    var payload = null
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { }
-    if (payload.view === "installed" && root.view === "details" && !installedProc.running) installedProc.running = true
+    root.installedWanted = !!payload && typeof payload === "object" && payload.view === "installed" && root.view === "details"
+    if (root.installedWanted && !installedProc.running) installedProc.running = true
     root.reload()
     Qt.callLater(function() { keys.forceActiveFocus() })
   }
 
-  function close() { root.opened = false }
+  function close() { root.opened = false; root.installedWanted = false }
 
   function dismiss() {
     root.opened = false
+    root.installedWanted = false
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "io.github.ai-dico.auto-update")
   }
@@ -465,7 +469,8 @@ Item {
       onStreamFinished: {
         var a = null
         try { a = JSON.parse(text) } catch (e) { }
-        if (!a || !a.ok) return
+        if (!a || !a.ok || !root.installedWanted) return
+        root.installedWanted = false
         root.installed = a
         if (root.view === "details") root.view = "installed"
       }
@@ -901,12 +906,19 @@ Item {
 
         // What the last update installed on restart changed, and how to go back
         Text {
-          visible: root.view === "installed"
+          // Results from before this list was recorded have none.
+          visible: root.view === "installed" && text !== ""
           width: parent.width
           textFormat: Text.PlainText
-          text: ((root.installed && root.installed.packages) || []).map(function(p) {
-            return p.name + "  " + (p.from ? p.from + " → " : "") + p.to
-          }).join("\n")
+          // The first dozen; the card does not scroll.
+          text: {
+            var pkgs = (root.installed && root.installed.packages) || []
+            var lines = pkgs.slice(0, 12).map(function(p) {
+              return p.name + "  " + (p.from ? p.from + " → " : "") + p.to
+            })
+            if (pkgs.length > 12) lines.push("and " + (pkgs.length - 12) + " more")
+            return lines.join("\n")
+          }
           color: root.foreground
           opacity: 0.75
           font.family: "monospace"
@@ -969,7 +981,7 @@ Item {
 
         // Raw output, only on request
         Column {
-          visible: root.view !== "password" && root.view !== "applied"
+          visible: root.view !== "password" && root.view !== "applied" && root.view !== "installed"
           width: parent.width
           spacing: Style.spacing.sm
           Button {

@@ -593,10 +593,14 @@ def apply():
                        + ", so nothing was installed. Run Omarchy's updater to decide.")
 
         # What changes, for the overlay's "installed" view after the restart.
-        q = run(["pacman", "-Q", *[p[0] for p in plan]], 60, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=PACMAN_ENV)
-        before = dict(line.split()[:2] for line in q.stdout.splitlines() if len(line.split()) >= 2)
-        result["packages"] = [{"name": n, "from": before.get(n, ""), "to": v} for n, v, *_ in plan]
+        # Only a nicety: never a reason not to install.
+        try:
+            q = run(["pacman", "-Q", *[p[0] for p in plan]], 60, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, env=PACMAN_ENV)
+            before = dict(line.split()[:2] for line in q.stdout.splitlines() if len(line.split()) >= 2)
+            result["packages"] = [{"name": n, "from": before.get(n, ""), "to": v} for n, v, *_ in plan]
+        except Exception:
+            pass
 
         say(log, "Saving a restore point…")
         result["snapshots"], result["bootMenu"] = snapshot(log, f"Auto Update {agreed[:12]}")

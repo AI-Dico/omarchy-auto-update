@@ -400,7 +400,38 @@ ack_applied() {
 # The last update installed on restart, seen or not: what the overlay's
 # "installed" view shows when the note after it is clicked.
 last_applied() {
-  jq -c 'select(.ok == true)' "$SPOOL/result.json" 2>/dev/null | grep . || echo '{}'
+  local r
+  r=$(jq -c 'select(.ok == true)' "$SPOOL/result.json" 2>/dev/null) || r=""
+  [[ -n $r ]] || { echo '{}'; return 0; }
+  # Results written before the installer recorded the packages have none; read
+  # them from pacman's log, between the start and the end of that install.
+  if [[ $(jq -r '.packages | type' <<<"$r") != array ]]; then
+    r=$(python3 -I - "$r" /var/log/pacman.log <<'PY' 2>/dev/null || echo "$r"
+import json, re, sys
+from datetime import datetime
+r = json.loads(sys.argv[1])
+start, end = r.get("at", 0), r.get("finishedAt", 0) + 2
+line_re = re.compile(r"^\[([^\]]+)\] \[ALPM\] (upgraded|installed|downgraded) (\S+) \((.+)\)$")
+pkgs = []
+with open(sys.argv[2], errors="replace") as f:
+    for line in f:
+        m = line_re.match(line.rstrip("\n"))
+        if not m:
+            continue
+        try:
+            t = datetime.fromisoformat(m.group(1)).timestamp()
+        except ValueError:
+            continue
+        if start <= t <= end:
+            old, _, new = m.group(4).rpartition(" -> ")
+            pkgs.append({"name": m.group(3), "from": old, "to": new})
+if pkgs:
+    r["packages"] = pkgs
+print(json.dumps(r, separators=(",", ":")))
+PY
+)
+  fi
+  echo "$r"
 }
 
 ack_news() {
