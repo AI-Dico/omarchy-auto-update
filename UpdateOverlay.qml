@@ -56,6 +56,8 @@ Item {
   property var trying: null
   property string beforeConfirm: "installed"
   property string rollbackError: ""
+  // Kept for good but not restarted yet: only the restart is left.
+  property bool keptNoRestart: false
   readonly property string runner: decodeURIComponent(String(Qt.resolvedUrl("bin/omarchy-auto-update-runner")).replace(/^file:\/\//, ""))
   property bool awaitingPassword: false
   // Typed before the runner finished re-checking the set; sent when it asks.
@@ -76,7 +78,9 @@ Item {
     root.opened = true
     root.showPackages = false
     // A finished run stays on screen until dismissed; an idle overlay starts fresh.
-    if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied" && root.view !== "trying") root.view = "details"
+    if (keepProc.running) root.view = "keeping"  // the restore runs on: nothing else until it ends
+    else if (root.keptNoRestart) root.view = "keep-confirm"
+    else if (!runProc.running && !tailProc.running && root.view !== "done" && root.view !== "applied" && root.view !== "trying") root.view = "details"
     // From the note after an update installed on restart: what it changed.
     var payload = null
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { }
@@ -106,6 +110,12 @@ Item {
     if (checkProc.running) return
     root.status = Object.assign({}, root.status, { state: "checking", message: "Checking for updates" })
     checkProc.running = true
+  }
+
+  function installAgain() {
+    if (checkProc.running || againProc.running) return
+    root.status = Object.assign({}, root.status, { state: "checking", message: "Checking for updates" })
+    againProc.running = true
   }
 
   function updateNow() { root.startRun("update", [root.runner, root.fingerprint(root.status)]) }
@@ -350,6 +360,7 @@ Item {
       case "waiting": return "Updates found"
       case "attention": return "Updates need your attention"
       case "error": return "Couldn't prepare updates"
+      case "held": return status.count === 1 ? "1 update on hold" : status.count + " updates on hold"
       case "ready":
         if (status.tier === "major") return "A new version of Omarchy is ready"
         return status.count === 1 ? "1 update is ready" : status.count + " updates are ready"
@@ -402,6 +413,12 @@ Item {
       onStreamFinished: { try { root.status = JSON.parse(text) } catch (e) { } root.reload() }
     }
     onExited: Quickshell.execDetached(["omarchy-shell", "io.github.ai-dico.auto-update.bar", "reload"])
+  }
+
+  Process {
+    id: againProc
+    command: [root.helper, "install-again"]
+    onExited: { root.reload(); Quickshell.execDetached(["omarchy-shell", "io.github.ai-dico.auto-update.bar", "reload"]) }
   }
 
   Process {
@@ -490,7 +507,13 @@ Item {
     var n = (root.trying && root.trying.count) || 0
     return "Nothing has changed for good yet. This is your computer as it was on " + root.rollbackDate() + ", before "
       + (n === 1 ? "the update" : "the " + n + " updates") + ", and your files and settings are as you left them. "
-      + "Use it as long as you like. Return to the updated version, or undo the update only if this one works better."
+      + "Use it as long as you like. Return to the updated version, or keep this one if it works better."
+  }
+
+  function keepText() {
+    return "Your computer keeps this version and restarts. The updated version isn't deleted: it stays in the boot menu "
+      + "under Snapshots. Your files and settings stay as they are, and the update is held back until a newer one comes. "
+      + "This asks for your password."
   }
 
   function appliedText() {
@@ -557,12 +580,16 @@ Item {
           // No pop-up: deciding takes using it for a while. A note says so;
           // the bar icon opens the decision whenever the user is ready.
           root.trying = st
-          if (root.opened) root.view = "trying"
+          if (root.opened && root.view === "details") root.view = "trying"
           else Quickshell.execDetached(["bash", "-c",
             '[[ $(notify-send -a "Auto Update" -t 20000 -A default=Open -- "$1" "$2") == default ]] && ' +
             'omarchy-shell shell summon io.github.ai-dico.auto-update "{}"', "notify",
             "Trying the version from before the update",
             "Use it as long as you like. When you've decided, click the update icon in the bar to keep it or return to the updated version."])
+        } else if (st.kept) {
+          Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "20000",
+            "Kept the version from before the update",
+            "The update is on hold until a newer one comes. The updated version stays in the boot menu under Snapshots."])
         } else if (st.missed) {
           Quickshell.execDetached(["notify-send", "-a", "Auto Update", "-t", "15000",
             "Couldn't open the restore point",
@@ -588,6 +615,23 @@ Item {
       // On success the computer is already restarting.
       if (code !== 0) root.rollbackError = "Couldn't restart into the restore point: "
         + (tryErr.text.replace(/^omarchy-auto-update: /, "").trim() || "unknown error") + "."
+    }
+  }
+  Process {
+    id: keepProc
+    command: [root.helper, "keep-restore"]
+    stderr: StdioCollector { id: keepErr }
+    onExited: function(code) {
+      // On success the computer is already restarting.
+      if (code !== 0) {
+        var lines = keepErr.text.replace(/^omarchy-auto-update: /mg, "").trim().split("\n")
+        var last = lines[lines.length - 1] || ""
+        // Kept, but the restart was left to the user.
+        root.keptNoRestart = last.indexOf("kept; ") === 0
+        root.rollbackError = root.keptNoRestart ? "This version is kept, but " + last.slice(6) + "."
+          : "Couldn't keep this version: " + (lines.join(" ") || "unknown error") + "."
+        root.view = "keep-confirm"
+      }
     }
   }
   Process {
@@ -934,6 +978,13 @@ Item {
               onClicked: root.checkNow()
             }
             Button {
+              visible: root.status.state === "held"
+              text: "Install again"
+              iconText: "󰇚"
+              enabled: !againProc.running
+              onClicked: root.installAgain()
+            }
+            Button {
               visible: (root.ready && !root.restartTier) || (root.status.state === "attention" && !root.restartPending)
               text: "Update now"
               iconText: "󰇚"
@@ -982,7 +1033,7 @@ Item {
           Text {
             id: runIcon
             anchors.verticalCenter: parent.verticalCenter
-            text: (root.view === "rollback-confirm" || root.view === "trying") ? "󰜉"
+            text: (root.view === "rollback-confirm" || root.view === "trying" || root.view === "keep-confirm" || root.view === "keeping") ? "󰜉"
                 : root.view === "installed" ? "\udb80\udd34"
                 : (root.view === "password" && !root.passwordSent) ? "\udb80\udf3e"
                 : root.view === "password" ? "\udb81\udc50"
@@ -992,7 +1043,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.displayLarge
             RotationAnimation on rotation {
-              running: (root.view === "running" || (root.view === "password" && root.passwordSent)) && root.opened
+              running: (root.view === "running" || root.view === "keeping" || (root.view === "password" && root.passwordSent)) && root.opened
               from: 0; to: 360; duration: 1200; loops: Animation.Infinite
               onRunningChanged: if (!running) runIcon.rotation = 0
             }
@@ -1007,6 +1058,8 @@ Item {
                   : root.view === "installed" ? root.installedTitle()
                   : root.view === "rollback-confirm" ? "Go back to before this update?"
                   : root.view === "trying" ? "You're trying the version from before the update"
+                  : root.view === "keep-confirm" ? "Keep the version from " + root.rollbackDate() + "?"
+                  : root.view === "keeping" ? "Keeping this version…"
                   : (root.view === "password" && root.passwordSent) ? (root.runKind === "stage" ? "Getting ready for the restart…" : "Checking your password…")
                   : root.view === "password" ? (root.runKind === "stage" ? "Enter your password to install updates when you restart"
                       : root.runKind === "finish" ? "One more step to finish the update"
@@ -1029,6 +1082,8 @@ Item {
                   : root.view === "installed" ? root.installedText()
                   : root.view === "rollback-confirm" ? (root.rollbackError || root.confirmText())
                   : root.view === "trying" ? (root.rollbackError || root.tryingText())
+                  : root.view === "keep-confirm" ? (root.rollbackError || root.keepText())
+                  : root.view === "keeping" ? "Please don't turn off your computer. It restarts when this is done."
                   : (root.view === "password" && root.passwordSent) ? "This takes a few seconds."
                   : root.view === "password" ? (root.passwordQueued ? "Checking the updates once more…"
                       : root.passwordRetry ? "That password didn't work. Try again."
@@ -1241,9 +1296,31 @@ Item {
           }
           Button {
             visible: root.view === "trying"
-            text: "Undo the update for good…"
-            // Omarchy's own restore: it asks for the password in a terminal.
-            onClicked: Quickshell.execDetached(["limine-snapper-restore"])
+            text: "Keep this version…"
+            onClicked: { root.rollbackError = ""; root.view = "keep-confirm" }
+          }
+          Button {
+            visible: root.view === "keep-confirm" && root.keptNoRestart
+            text: "Restart"
+            iconText: "󰜉"
+            bordered: true
+            selected: true
+            onClicked: Quickshell.execDetached(["systemctl", "reboot"])
+          }
+          Button {
+            visible: root.view === "keep-confirm" && !root.keptNoRestart
+            text: "Cancel"
+            onClicked: { root.rollbackError = ""; root.view = "trying" }
+          }
+          Button {
+            // Once kept, only a restart is left to do.
+            visible: root.view === "keep-confirm" && !root.keptNoRestart
+            text: "Keep and restart"
+            iconText: "󰜉"
+            bordered: true
+            selected: true
+            enabled: !keepProc.running
+            onClicked: { root.rollbackError = ""; root.view = "keeping"; keepProc.running = true }
           }
           Button {
             visible: root.view === "trying"
@@ -1251,7 +1328,7 @@ Item {
             iconText: "󰜉"
             bordered: true
             selected: true
-            enabled: !returnProc.running
+            enabled: !returnProc.running && !keepProc.running
             onClicked: returnProc.running = true
           }
           Button {

@@ -30,7 +30,8 @@ setup() {
   export OMARCHY_AUTO_UPDATE_PKEXEC="$T/pkexec"
   printf '#!/bin/sh\necho "systemctl $*" >>"%s/calls"\n' "$T" >"$T/systemctl"
   # pkexec: records the root command; FAKE_DENY=1 is a cancelled password dialog.
-  printf '#!/bin/sh\n[ -n "$FAKE_DENY" ] && exit 126\necho "pkexec $*" >>"%s/calls"\n' "$T" >"$T/pkexec"
+  # Limine's restore (through script) runs for real, as the stand-in in $T/lss.
+  printf '#!/bin/sh\n[ -n "$FAKE_DENY" ] && exit 126\necho "pkexec $*" >>"%s/calls"\n[ "${1##*/}" = script ] && exec "$@"\nexit 0\n' "$T" >"$T/pkexec"
   chmod +x "$T/systemctl" "$T/pkexec"
   echo "rootflags=subvol=/@ quiet" >"$T/cmdline"
   # Snapshot 6 taken two seconds after the install started (08:50:37 local).
@@ -169,6 +170,91 @@ echo "15. a partly installed update can be shown"
 setup
 jq '.ok = false | .state = "partial" | .packages = [{"name":"a","from":"1","to":"2"}]' "$T/spool/result.json" >"$T/r" && mv "$T/r" "$T/spool/result.json"
 [[ $("$H" last-applied | jq -r .state) == partial ]] && ok "last-applied returns it" || no "last-applied returns it"
+
+# A stand-in for Limine's restore: asks what the real one asks, records the answers.
+make_lss() {
+  cat >"$T/lss" <<EOF
+#!/bin/bash
+echo "Snapshot ID     : \${FAKE_SNAP:-6}"
+echo " Restore snapshot \${FAKE_SNAP:-6} (method: replace)?"
+echo " [r] restore | [l] list | [c] cancel"
+printf 'Choice [r/l/c]: '; read -r a; echo "choice=\$a" >>"$T/answers"
+[[ \$a == r ]] || exit 0
+printf 'Description for backup subvolume @: '; read -r d; echo "describe=\$d" >>"$T/answers"
+echo "Mounting Btrfs..."
+[[ -n \${FAKE_HOOK:-} ]] && { printf 'Continue? [Y/n]: '; read -r h; echo "hook=\$h" >>"$T/answers"; printf 'Also this? [y/N]: '; read -r h; echo "hook2=\$h" >>"$T/answers"; }
+printf '\nRestore complete. Reboot now? [Y/n]: '; read -r b; echo "reboot=\$b" >>"$T/answers"
+EOF
+  chmod +x "$T/lss"
+  export OMARCHY_AUTO_UPDATE_LSS="$T/lss"
+}
+reboots() { grep -c '^systemctl reboot' "$T/calls"; }
+
+echo "16. keeping the restore point"
+setup
+make_lss
+jq '.packages = [{"name":"a","from":"1","to":"2"}]' "$T/spool/result.json" >"$T/r" && mv "$T/r" "$T/spool/result.json"
+"$H" try-restore
+echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+"$H" keep-restore && ok "kept" || no "kept ($(cat "$T/cache/omarchy-auto-update/restore.log" 2>/dev/null | tail -3))"
+[[ $(tr '\n' ' ' <"$T/answers") == "choice=r describe=The updated version, kept by Auto Update reboot=n " ]] &&
+  ok "answered once each" || no "answered once each ($(tr '\n' ' ' <"$T/answers"))"
+[[ $(tail -n 1 "$T/calls") == "systemctl reboot" ]] && ok "then a restart" || no "then a restart"
+[[ $(jq -r '.packages[0].to' "$T/state/omarchy-auto-update/held.json") == 2 ]] && ok "the update is held" || no "the update is held"
+[[ $(state .phase) == kept ]] && ok "the try says kept" || no "the try says kept"
+
+echo "17. after the restart"
+echo "rootflags=subvol=/@" >"$T/cmdline"
+jq '.fromBoot = "earlier"' "$T/state/omarchy-auto-update/rollback.json" >"$T/r" && mv "$T/r" "$T/state/omarchy-auto-update/rollback.json"
+[[ $("$H" snapshot-state | jq -r '.kept | type') == object ]] && ok "says it was kept" || no "says it was kept"
+[[ ! -e $T/state/omarchy-auto-update/rollback.json ]] && ok "once" || no "once"
+mkdir -p "$T/cache/omarchy-auto-update"
+echo '{"state":"ready","count":1,"packages":[{"name":"a","from":"1","to":"2"}],"fingerprint":"x"}' >"$T/cache/omarchy-auto-update/state.json"
+[[ $("$H" status | jq -r .state) == held ]] && ok "the same set waits" || no "the same set waits"
+echo '{"state":"ready","count":1,"packages":[{"name":"a","from":"1","to":"3"}],"fingerprint":"y"}' >"$T/cache/omarchy-auto-update/state.json"
+[[ $("$H" status | jq -r .state) == ready ]] && ok "a newer one is offered" || no "a newer one is offered"
+[[ ! -e $T/state/omarchy-auto-update/held.json ]] && ok "and ends the hold" || no "and ends the hold"
+
+echo "18. a restore point that isn't the one asked about"
+setup
+make_lss
+"$H" try-restore
+echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+FAKE_SNAP=5 "$H" keep-restore 2>/dev/null && no "stops" || ok "stops"
+[[ $(cat "$T/answers") == "choice=c" ]] && ok "cancelled at the question" || no "cancelled at the question"
+[[ $(reboots) == 1 && ! -e $T/state/omarchy-auto-update/held.json ]] && ok "no restart, nothing held" || no "no restart, nothing held"
+
+echo "19. the password dialog is cancelled when keeping"
+setup
+make_lss
+"$H" try-restore
+echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+FAKE_DENY=1 "$H" keep-restore 2>"$T/err" && no "stops" || ok "stops"
+grep -q "password wasn't given" "$T/err" && ok "says why" || no "says why ($(cat "$T/err"))"
+[[ ! -e $T/answers && $(state .phase) == requested && ! -e $T/state/omarchy-auto-update/held.json ]] && ok "still trying" || no "still trying"
+
+echo "20. not from the normal system"
+setup
+make_lss
+"$H" keep-restore 2>/dev/null && no "refused" || ok "refused"
+
+echo "21. a hook asks something after the restore started"
+setup
+make_lss
+"$H" try-restore
+echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+FAKE_HOOK=1 "$H" keep-restore && ok "still kept" || no "still kept"
+grep -qx "hook=n" "$T/answers" && grep -qx "hook2=n" "$T/answers" && ok "answered no" || no "answered no ($(tr '\n' ' ' <"$T/answers"))"
+
+echo "22. the hold can't be saved"
+setup
+make_lss
+"$H" try-restore
+echo "rootflags=subvol=/@/.snapshots/6/snapshot" >"$T/cmdline"
+chmod 500 "$T/state/omarchy-auto-update"
+"$H" keep-restore 2>/dev/null && no "stops" || ok "stops"
+[[ ! -e $T/answers ]] && ok "before restoring" || no "before restoring"
+chmod 700 "$T/state/omarchy-auto-update"
 
 echo "passed $pass, failed $fail"
 ((fail == 0))

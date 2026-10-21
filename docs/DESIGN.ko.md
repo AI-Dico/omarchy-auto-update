@@ -109,7 +109,12 @@
   - 돌아오기는 그냥 재시작이다. 오마치 Limine 설정은 기본 항목이 정상 시스템이고 마지막 항목을 기억하지 않는다. 그래도 다시 복원 지점으로 오면 두 번째에는 정상 항목을 이름으로 지정한다(비밀번호).
   - 시험 상태는 `~/.local/state/omarchy-auto-update/rollback.json`(@home)에 둔다. `/var/lib` 은 `/@` 안이라 되돌리면 함께 사라진다.
   - 설치기는 자기 복원 지점을 snapper 정리 대상에서 뺀다(`cleanup ""`, userdata `omarchy-auto-update=yes`). 새로 만들 때 이전 것은 number 정리로 돌려준다.
-  - 「영구히 되돌리기」는 아직 오마치의 복원 도구(`limine-snapper-restore`, 터미널)를 연다. 우리 화면으로 옮기는 것은 2차다. 복원 질문 처리, 중간 전원 차단, 커널이 바뀐 묶음을 VM 에서 먼저 검증해야 한다.
+  - **그대로 두기** (2차, 2026-10-21 Try Omarchy VM 실측 통과): 시험 화면의 「Keep this version…」→ 확인 → 오마치 비밀번호 창 → 재시작.
+    - 복원은 Limine 의 것(`limine-snapper-sync --restore --no-mutex`, `RESTORE_METHOD=replace`)을 그대로 쓴다. 지금 `/@` 를 복원 지점 사본으로 바꾸고, 업데이트된 `/@` 는 지우지 않고 새 복원 지점(설명 「The updated version, kept by Auto Update」)으로 부팅 메뉴에 남긴다. 커널도 그 복원 지점의 판으로 되돌린다(커널 업데이트 포함 묶음 실측).
+    - 이 도구는 질문 세 개(`Choice [r/l/c]`, 백업 설명, `Reboot now? [Y/n]`)를 줄 편집기로 읽는다. 파이프로는 두 번째 질문에서 CPU 100% 로 멈춘다(실측). 그래서 `pkexec /usr/bin/script -qefc "env LC_ALL=C.UTF-8 … --restore --no-mutex" /dev/null` 로 가상 터미널을 만들고, 헬퍼가 출력을 읽어 질문마다 한 번만 답한다. 복원할 번호가 우리 시험 번호와 다르거나 모르는 질문이 나오면 취소한다. 재시작은 헬퍼가 직접 한다(`n` 으로 답함).
+    - 그 뒤 첫 정상 부팅에서 알림 한 번(「Kept the version from before the update」)을 띄운다.
+    - 되돌린 묶음은 **더 새 게 나올 때까지 보류**한다(사용자 결정). `~/.local/state/omarchy-auto-update/held.json` 에 `이름 새판` 목록을 두고, 점검한 묶음이 그 안에 다 들어 있으면 상태를 `held`(「N updates on hold」, 「Install again」)로 바꾼다. 하나라도 더 새 판이 있으면 평소처럼 권하고 보류를 끝낸다. 업데이트 기록(`/var/lib/omarchy-auto-update`)은 `/@` 안이라 복원과 함께 되돌아가므로 보류는 @home 에 둔다.
+    - 남은 일: 복원 도중 전원 차단은 아직 시험하지 않았다(Limine 의 `mv` 두 번 사이). 작은 화면(800×600)에서 창이 넘쳐 아래 버튼이 잘린다.
   - **남은 위험**: 사용자 권한으로는 `/.snapshots`·`/boot` 를 읽지 못해 대상이 지금도 부팅 가능한지 확인할 수 없다. 항목이 사라졌으면 Limine 이 기본 항목(업데이트된 시스템)으로 부팅하고, 우리는 「복원 지점을 열지 못했다」고 알린다.
 - **한계**: 스냅샷 대상은 루트(`/`)뿐이라 홈 폴더는 되돌리지 않는다. 그래서 마이그레이션이 바꾸는 `~/.config` 파일은 적용 전에 따로 백업해 함께 복원한다(3단계).
 - **취소**: 재시작 대기 중인 묶음을 화면에서 취소하는 버튼은 아직 없다. 3일이 지나면 저절로 버려지고, 직접 지우려면 `sudo /usr/local/libexec/omarchy-auto-update/offline cancel` 이다(실측 통과).

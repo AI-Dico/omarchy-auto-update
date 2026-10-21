@@ -24,6 +24,9 @@
 #   omarchy-auto-update try-restore     restart once into the restore point taken before it
 #   omarchy-auto-update snapshot-state  whether this boot is a restore point, and ours
 #   omarchy-auto-update return-updated  from a restore point, restart into the normal system
+#   omarchy-auto-update keep-restore    from a restore point, keep it for good (password)
+#                                       and restart; the update is held back after it
+#   omarchy-auto-update install-again   offer the held-back update again
 #
 # Nothing here needs root or touches the system: the package databases are
 # synced into a private copy and packages are downloaded into a private cache,
@@ -69,6 +72,13 @@ SYSTEMCTL="${OMARCHY_AUTO_UPDATE_SYSTEMCTL:-/usr/bin/systemctl}"
 # bootctl, with Omarchy's password dialog (polkit).
 PKEXEC="${OMARCHY_AUTO_UPDATE_PKEXEC:-/usr/bin/pkexec}"
 BOOTCTL=/usr/bin/bootctl
+# Keeping a restore point is Limine's own restore, run on a pseudo-terminal it
+# needs (it reads its answers line by line from one).
+SCRIPT="${OMARCHY_AUTO_UPDATE_SCRIPT:-/usr/bin/script}"
+LSS="${OMARCHY_AUTO_UPDATE_LSS:-/usr/bin/limine-snapper-sync}"
+RESTORE_LOG="$BASE/restore.log"
+# An update the user went back from: not offered again until a newer set comes.
+HELD="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-auto-update/held.json"
 
 # A set that touches any of these is installed on restart, never under a
 # running session: kernel and boot chain, core libraries, graphics, the shell
@@ -342,6 +352,7 @@ status() {
   fi
   [[ -f $RUN_EVENTS ]] && s=$(jq -c '. + {run: true}' <<<"$s" 2>/dev/null || echo "$s")
   s=$(offline_state "$s")
+  s=$(held_state "$s")
   # The bar icon setting rides along, so the bar picks it up on its usual reload,
   # and so does the key `notify` uses to tell each set or state only once.
   jq -c --arg mode "$(icon_mode)" "$NOTIFY_KEYS_JQ"' as $keys | . + {iconMode: $mode, notifyKeys: $keys, notifyKey: ($keys | join("|"))}' <<<"$s" 2>/dev/null ||
@@ -628,13 +639,149 @@ snapshot_state() {
     return 0
   fi
   [[ -f $ROLLBACK ]] && try=$(jq -c . "$ROLLBACK" 2>/dev/null || echo '{}')
-  local phase missed=false
+  local phase missed=false kept=null
   phase=$(jq -r '.phase // empty' <<<"$try")
   if [[ $phase == requested && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
     missed=true
   fi
+  # Kept for good: the first normal boot after it says so, once.
+  [[ $phase == kept ]] && kept=$(jq -c '{at, count, keptAt}' <<<"$try")
   [[ -n $phase && $(jq -r '.fromBoot // empty' <<<"$try") != "$(cat /proc/sys/kernel/random/boot_id)" ]] && end_try
-  jq -cn --argjson missed "$missed" '{inSnapshot: null, missed: $missed}'
+  jq -cn --argjson missed "$missed" --argjson kept "$kept" '{inSnapshot: null, missed: $missed, kept: $kept}'
+}
+
+# Keep the restore point being tried: Limine's restore makes it the system
+# (the updated one is kept as a restore point of its own, in the boot menu),
+# then a plain restart starts it. The update is held back afterwards.
+keep_restore() {
+  local current try
+  current=$(booted_snapshot)
+  [[ -n $current ]] || die "not running from a restore point"
+  try=$(jq -c . "$ROLLBACK" 2>/dev/null) || die "this restore point wasn't started by Auto Update"
+  [[ $(jq -r '.snapshot // empty' <<<"$try") == "$current" ]] || die "this restore point wasn't started by Auto Update"
+  mkdir -p "$BASE"
+  # The records the restored system needs are written first: if they can't be,
+  # nothing is restored. They take effect by a rename once it is done.
+  if ! jq -c '{at: (now | floor), from: .at, packages: (.packages // [])}' <<<"$try" >"$HELD.next" ||
+    ! jq -c --argjson t "$(now)" '.phase = "kept" | .keptAt = $t' <<<"$try" >"$ROLLBACK.next"; then
+    rm -f "$HELD.next" "$ROLLBACK.next"
+    die "couldn't save what to hold back; nothing changed"
+  fi
+  # Its answers come only for this restore point's number; anything else it asks
+  # is cancelled, and the restore happens only after the password.
+  if ! python3 -I - "$current" "$RESTORE_LOG" "$PKEXEC" "$SCRIPT" "$LSS" <<'PY'; then
+import os, re, select, subprocess, sys, time
+want, log_path, pkexec, script, lss = sys.argv[1:6]
+cmd = [pkexec, script, "-qefc", "env LC_ALL=C.UTF-8 LANG=C.UTF-8 " + lss + " --restore --no-mutex", "/dev/null"]
+ansi = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+log = open(log_path, "wb")
+p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+fd, pending, seen = p.stdout.fileno(), b"", b""
+started = done = cancelled = False
+asked = set()
+closed = False
+last = time.time()
+def answer(text):
+    if closed:
+        return
+    try:
+        p.stdin.write(text); p.stdin.flush()
+    except OSError:
+        pass
+while True:
+    ready, _, _ = select.select([fd], [], [], 1)
+    if ready:
+        data = os.read(fd, 4096)
+        if not data:
+            break
+        log.write(data); log.flush(); last = time.time()
+        pending += data
+        text = ansi.sub(b"", pending).replace(b"\r", b"")
+        seen = (seen + text)[-4000:]
+        if b"Mounting Btrfs" in text:
+            started = True
+        if b"Restore complete" in text:
+            done = True
+        # The line editor redraws a prompt as it is answered: each is answered once.
+        kind = (b"restore" if re.search(rb"Choice \[r/l/c\]: $", text)
+                else b"describe" if re.search(rb"Description for backup subvolume[^\n]*: $", text)
+                else b"reboot" if re.search(rb"Reboot now\? \[Y/n\]: $", text)
+                else b"exit" if re.search(rb"Press Enter to exit: $", text)
+                else b"other:" + text.rsplit(b"\n", 1)[-1] if re.search(rb"(Choice \[[a-z/]+\]|\[[Yy]/[Nn]\]): $", text) else None)
+        if kind and kind not in asked:
+            asked.add(kind); pending = b""
+            if kind == b"restore":
+                m = re.findall(rb"Restore snapshot (\d+) ", seen)
+                if m and m[-1].decode() == want:
+                    answer(b"r\n")
+                else:
+                    cancelled = True; answer(b"c\n")
+            elif kind == b"describe":
+                answer(b"The updated version, kept by Auto Update\n")
+            elif kind == b"reboot":
+                answer(b"n\n")
+            elif kind == b"exit":
+                answer(b"\n")
+            else:
+                # A question we don't know: say no. Before the restore started
+                # that cancels it; after, it is a hook's, and the restore goes on.
+                cancelled = cancelled or not started
+                answer(b"c\n" if b"Choice" in text else b"n\n")
+    elif not closed and time.time() - last > (120 if not started else 600):
+        # Silent at a question we don't know. It runs as root, so it can only be
+        # told end of input; it is watched until it really ends either way.
+        cancelled = cancelled or not started
+        closed = True
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+code = p.wait()
+log.close()
+if done and code == 0 and not (cancelled and not started):
+    sys.exit(0)
+if code in (126, 127) and not started:
+    print("the password wasn't given", file=sys.stderr)
+elif started:
+    print("the restore didn't finish; see " + log_path, file=sys.stderr)
+else:
+    print("the restore was cancelled; nothing changed", file=sys.stderr)
+sys.exit(1)
+PY
+    rm -f "$HELD.next" "$ROLLBACK.next"
+    die "couldn't keep the restore point"
+  fi
+  # From here the restore point is the system. Hold the update back and say so
+  # after the restart; both live in the home subvolume the restore didn't touch.
+  # Without its records the restart waits for the user, who is told why.
+  mv -f "$HELD.next" "$HELD" 2>/dev/null || die "kept; couldn't hold the update back, so it is offered again. Restart to start this version"
+  mv -f "$ROLLBACK.next" "$ROLLBACK" 2>/dev/null || die "kept; couldn't record it. Restart to start this version"
+  "$SYSTEMCTL" reboot || die "kept; restart to start it"
+}
+
+# The update the user went back from stays out of the way while the same set is
+# all there is. A set with anything newer is offered as usual and ends the hold.
+held_state() {
+  local s="$1" out
+  [[ -f $HELD ]] || { echo "$s"; return 0; }
+  out=$(jq -c --slurpfile h "$HELD" '
+    def key: (.name // "") + " " + (.to // "");
+    ($h[0].packages // [] | map(key)) as $held
+    | if .state == "ready" and (.packages // [] | length) > 0 then
+        if all(.packages[]; key as $k | any($held[]; . == $k)) and ($held | length) > 0
+        then . + {state: "held", reason: "held", message: "On hold: you went back from these updates", heldAt: $h[0].at}
+        else . + {heldEnded: true} end
+      else . end' <<<"$s" 2>/dev/null) || { echo "$s"; return 0; }
+  if [[ $(jq -r '.heldEnded // false' <<<"$out") == true ]]; then
+    rm -f "$HELD"
+    out=$(jq -c 'del(.heldEnded)' <<<"$out")
+  fi
+  echo "$out"
+}
+
+install_again() {
+  rm -f "$HELD"
+  run --force
 }
 
 # From a restore point back to the normal system. Omarchy's Limine menu starts
@@ -1045,6 +1192,8 @@ case "$cmd" in
   try-restore) try_restore ;;
   snapshot-state) snapshot_state ;;
   return-updated) return_updated ;;
+  keep-restore) keep_restore ;;
+  install-again) install_again ;;
   -h | --help | help | "") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown command: $cmd (see --help)" ;;
 esac
