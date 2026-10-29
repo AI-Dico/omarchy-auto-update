@@ -396,6 +396,14 @@ offline_state() {
       health=$(jq -c . "$HEALTH" 2>/dev/null) || health=null
     fi
   fi
+  # A restart installed a set after the saved check: that check still lists the
+  # set as waiting, so until the next one the bar would say "restart to update"
+  # right after it did. Say it is installed instead.
+  if [[ $SPOOL/result.json -nt $STATE ]] && jq -e '.ok == true' "$SPOOL/result.json" >/dev/null 2>&1; then
+    s=$(jq -c --argjson n "$(jq '.count // 0' "$SPOOL/result.json" 2>/dev/null || echo 0)" \
+      '. + {state: "uptodate", reason: "installed", packages: [], count: 0, tier: null, fingerprint: null,
+            message: (($n | tostring) + (if $n == 1 then " update" else " updates" end) + " installed")}' <<<"$s" 2>/dev/null || echo "$s")
+  fi
   jq -c --argjson staged "${staged:-null}" --argjson applied "${applied:-null}" --argjson health "${health:-null}" \
     '. + {restartPending: $staged, applied: $applied, health: $health}' <<<"$s" 2>/dev/null || echo "$s"
 }

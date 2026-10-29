@@ -555,10 +555,12 @@ Item {
     }
   }
 
-  // Wait for the session to settle before judging it.
+  // Wait for the session to settle before judging it. The "installed" note
+  // waits on this and the finish after it, so keep it short: by the time the
+  // shell is up, the user units have started.
   Timer {
     id: afterTimer
-    interval: 45000
+    interval: 15000
     running: true
     onTriggered: if (root.status.applied && !afterProc.running) afterProc.running = true
   }

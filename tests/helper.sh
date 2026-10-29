@@ -227,3 +227,23 @@ shows() { jq -nr --arg mode "$1" "$2 | $SHOWS_JQ"; }
 [[ $(shows important '{state: "ready"}') == false ]] && ok "important hides a plain ready set" || no "important hides a plain ready set"
 [[ $(shows always '{state: "uptodate"}') == true ]] && ok "always shows up to date" || no "always shows up to date"
 [[ $(shows hidden '{state: "error"}') == false ]] && ok "hidden shows nothing" || no "hidden shows nothing"
+
+echo "11. right after a restart installed the set"
+helper_env
+mkdir -p "$T/spool"
+set_state '{"state":"ready","fingerprint":"aaa","count":70,"tier":"restart","packages":[{"name":"linux"}],"news":{"at":1,"title":"t","link":"l"}}'
+touch -d '-1 minute' "$XDG_CACHE_HOME/omarchy-auto-update/state.json"
+echo '{"id":"x-1","ok":true,"state":"installed","count":70}' >"$T/spool/result.json"
+s=$("$HELPER" status)
+[[ $(jq -r .state <<<"$s") == uptodate && $(jq -r .count <<<"$s") == 0 ]] &&
+  ok "the check from before the restart no longer says ready" || no "the check from before the restart no longer says ready"
+[[ $(jq -r .message <<<"$s") == "70 updates installed" ]] && ok "says how many were installed" || no "says how many were installed"
+[[ $(jq -r .notifyKey <<<"$s") != *ready:* ]] && ok "no notification for the installed set" || no "no notification for the installed set"
+[[ $(jq -r .news.title <<<"$s") == t ]] && ok "keeps the news" || no "keeps the news"
+echo x-1 >"$XDG_CACHE_HOME/omarchy-auto-update/applied-seen"
+[[ $("$HELPER" status | jq -r .state) == uptodate ]] && ok "stays installed once the result is seen" || no "stays installed once the result is seen"
+echo '{"id":"x-2","ok":false,"state":"failed","count":70}' >"$T/spool/result.json"
+[[ $("$HELPER" status | jq -r .state) == ready ]] && ok "a failed install leaves the set ready" || no "a failed install leaves the set ready"
+echo '{"id":"x-3","ok":true,"state":"installed","count":70}' >"$T/spool/result.json"
+touch -d '-2 minutes' "$T/spool/result.json"
+[[ $("$HELPER" status | jq -r .state) == ready ]] && ok "a check after the install is shown as it is" || no "a check after the install is shown as it is"
